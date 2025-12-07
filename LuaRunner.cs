@@ -53,6 +53,103 @@ namespace Flux
             // Enable Basic, Table, String, Math and Coroutine modules (safe subset)
             _script = new Script(CoreModules.Basic | CoreModules.Table | CoreModules.String | CoreModules.Math | CoreModules.Coroutine);
 
+            // Ensure essential base functions exist (setmetatable/getmetatable/rawset/rawget/loadstring/tonumber/next)
+            try
+            {
+                _script.Globals["setmetatable"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 2 && a[0].Type == DataType.Table)
+                    {
+                        var tbl = a[0].Table;
+                        if (a[1].Type == DataType.Table) tbl.MetaTable = a[1].Table;
+                        return DynValue.NewTable(tbl);
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["getmetatable"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1 && a[0].Type == DataType.Table)
+                    {
+                        var mt = a[0].Table.MetaTable;
+                        return mt != null ? DynValue.NewTable(mt) : DynValue.Nil;
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["rawset"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 3 && a[0].Type == DataType.Table)
+                    {
+                        var tbl = a[0].Table;
+                        tbl.Set(a[1], a[2]);
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["rawget"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 2 && a[0].Type == DataType.Table)
+                    {
+                        var tbl = a[0].Table;
+                        return tbl.Get(a[1]);
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["next"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1 && a[0].Type == DataType.Table)
+                    {
+                        var tbl = a[0].Table;
+                        var first = true;
+                        DynValue lastKey = DynValue.Nil;
+                        if (a.Count >= 2) lastKey = a[1];
+                        foreach (var p in tbl.Pairs)
+                        {
+                            if (lastKey.Type == DataType.Nil)
+                            {
+                                return DynValue.NewTuple(p.Key, p.Value);
+                            }
+                            if (p.Key.Equals(lastKey))
+                            {
+                                // return next after this key
+                                // but continue to next iteration to find it
+                                lastKey = DynValue.Nil; // mark to return next
+                                continue;
+                            }
+                        }
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["tonumber"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1)
+                    {
+                        var v = a[0];
+                        if (v.Type == DataType.Number) return v;
+                        if (v.Type == DataType.String && double.TryParse(v.String, out var d)) return DynValue.NewNumber(d);
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["loadstring"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    {
+                        try
+                        {
+                            var chunk = _script.LoadString(a[0].String);
+                            return DynValue.NewCallback((c2, a2) => { return _script.Call(chunk); });
+                        }
+                        catch { }
+                    }
+                    return DynValue.Nil;
+                });
+            }
+            catch { }
+
             // Expose common string function aliases used by many addons (strmatch, strfind, strsub, format)
             try
             {
@@ -640,6 +737,65 @@ namespace Flux
                         {
                             vf.OnLeave = a[1].Function;
                         }
+                        else if (scriptName == "OnEvent")
+                        {
+                            vf.OnEvent = a[1].Function;
+                        }
+                    }
+                    return DynValue.Nil;
+                }));
+
+                // Allow frames to register/unregister for events
+                t.Set("RegisterEvent", DynValue.NewCallback((c, a) =>
+                {
+                    if (vf == null) return DynValue.Nil;
+                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    {
+                        var ev = a[0].String;
+                        // wrap the frame's OnEvent handler so it receives (self, event, ...)
+                        if (vf.OnEvent != null)
+                        {
+                            var wrapper = DynValue.NewCallback((ctx2, cbArgs) =>
+                            {
+                                try
+                                {
+                                    var argsList = new List<DynValue> { DynValue.NewTable(vf.ToTable(_script)) };
+                                    if (cbArgs != null)
+                                    {
+                                        for (int i = 0; i < cbArgs.Count; i++) argsList.Add(cbArgs[i]);
+                                    }
+                                    _script.Call(vf.OnEvent, argsList.ToArray());
+                                }
+                                catch { }
+                                return DynValue.Nil;
+                            });
+
+                            if (!_eventHandlers.ContainsKey(ev)) _eventHandlers[ev] = new List<Closure>();
+                            _eventHandlers[ev].Add(wrapper.Function);
+                            // store wrapper for potential unregister
+                            vf.RegisteredEventWrappers ??= new Dictionary<string, Closure>();
+                            vf.RegisteredEventWrappers[ev] = wrapper.Function;
+                        }
+                        else
+                        {
+                            // no OnEvent set yet; still ensure an entry exists so libraries don't error
+                            if (!_eventHandlers.ContainsKey(ev)) _eventHandlers[ev] = new List<Closure>();
+                        }
+                    }
+                    return DynValue.Nil;
+                }));
+
+                t.Set("UnregisterEvent", DynValue.NewCallback((c, a) =>
+                {
+                    if (vf == null) return DynValue.Nil;
+                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    {
+                        var ev = a[0].String;
+                        if (vf.RegisteredEventWrappers != null && vf.RegisteredEventWrappers.TryGetValue(ev, out var closure))
+                        {
+                            if (_eventHandlers.TryGetValue(ev, out var list)) list.RemoveAll(cw => cw == closure);
+                            vf.RegisteredEventWrappers.Remove(ev);
+                        }
                     }
                     return DynValue.Nil;
                 }));
@@ -874,9 +1030,23 @@ namespace Flux
                 var mt = new Table(_script);
                 mt.Set("__call", DynValue.NewCallback((ctx, args) =>
                 {
-                    if (args.Count >= 1 && args[0].Type == DataType.String)
+                    // Diagnostic: log LibStub __call invocations
+                    try
                     {
-                        var name = args[0].String;
+                        var sb = new System.Text.StringBuilder();
+                        sb.Append("[LuaRunner-Diag] LibStub.__call args=");
+                        for (int i = 0; i < args.Count; i++) sb.AppendFormat("[{0}:{1}]", i, args[i].Type);
+                        EmitOutput(sb.ToString());
+                    }
+                    catch { }
+
+                    // Support both LibStub("Name") and LibStub:__call("Name") where self may appear as first arg
+                    string? name = null;
+                    if (args.Count >= 1 && args[0].Type == DataType.String) name = args[0].String;
+                    else if (args.Count >= 2 && args[1].Type == DataType.String) name = args[1].String;
+
+                    if (!string.IsNullOrEmpty(name))
+                    {
                         var dv = libsTbl.Get(name);
                         if (dv != null && dv.Type == DataType.Table) return DynValue.NewTable(dv.Table);
                         // fallback: if not in libsTbl, check our internal registry populated earlier
@@ -891,22 +1061,35 @@ namespace Flux
                 // LibStub:NewLibrary(name, minor)
                 libStub.Set("NewLibrary", DynValue.NewCallback((ctx, args) =>
                 {
-                    if (args.Count >= 1 && args[0].Type == DataType.String)
+                    try
                     {
-                        var name = args[0].String;
-                        int minor = 0;
-                        // accept number or string-like
-                        if (args.Count >= 2)
-                        {
-                            if (args[1].Type == DataType.Number) minor = (int)args[1].Number;
-                            else if (args[1].Type == DataType.String)
-                            {
-                                var mstr = args[1].String ?? string.Empty;
-                                var mm = System.Text.RegularExpressions.Regex.Match(mstr, "\\d+");
-                                if (mm.Success) minor = int.Parse(mm.Value);
-                            }
-                        }
+                        var sb = new System.Text.StringBuilder();
+                        sb.Append("[LuaRunner-Diag] LibStub.NewLibrary called args=");
+                        for (int i = 0; i < args.Count; i++) sb.AppendFormat("[{0}:{1}]", i, args[i].Type);
+                        EmitOutput(sb.ToString());
+                    }
+                    catch { }
 
+                    // support both NewLibrary(name, minor) and :NewLibrary(name, minor) where self is first arg
+                    string? name = null;
+                    int minor = 0;
+                    if (args.Count >= 1 && args[0].Type == DataType.String) name = args[0].String;
+                    else if (args.Count >= 2 && args[1].Type == DataType.String) name = args[1].String;
+
+                    if (args.Count >= 2)
+                    {
+                        var maybe = args[1].Type == DataType.Number ? args[1] : (args.Count >= 3 ? args[2] : DynValue.Nil);
+                        if (maybe != null && maybe.Type == DataType.Number) minor = (int)maybe.Number;
+                        else if (maybe != null && maybe.Type == DataType.String)
+                        {
+                            var mstr = maybe.String ?? string.Empty;
+                            var mm = System.Text.RegularExpressions.Regex.Match(mstr, "\\d+");
+                            if (mm.Success) minor = int.Parse(mm.Value);
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(name))
+                    {
                         var existingDv = libsTbl.Get(name);
                         var existingMinorDv = minorsTbl.Get(name);
                         int existingMinor = 0;
@@ -918,6 +1101,13 @@ namespace Flux
                         t.Set("__minor", DynValue.NewNumber(minor));
                         libsTbl.Set(name, DynValue.NewTable(t));
                         minorsTbl.Set(name, DynValue.NewNumber(minor));
+                        // Mirror into C# registry so LibStub calls from other contexts can find it
+                        try
+                        {
+                            _libRegistry[name] = t;
+                        }
+                        catch { }
+                        try { EmitOutput($"[LuaRunner-Diag] LibStub.NewLibrary created lib '{name}' minor={minor}"); } catch { }
                         return DynValue.NewTable(t);
                     }
                     return DynValue.Nil;
@@ -926,20 +1116,36 @@ namespace Flux
                 // LibStub:GetLibrary(name, silent)
                 libStub.Set("GetLibrary", DynValue.NewCallback((ctx, args) =>
                 {
-                    if (args.Count >= 1 && args[0].Type == DataType.String)
+                    try
                     {
-                        var name = args[0].String;
+                        var sb = new System.Text.StringBuilder();
+                        sb.Append("[LuaRunner-Diag] LibStub.GetLibrary called args=");
+                        for (int i = 0; i < args.Count; i++) sb.AppendFormat("[{0}:{1}]", i, args[i].Type);
+                        EmitOutput(sb.ToString());
+                    }
+                    catch { }
+
+                    // support both GetLibrary(name, silent) and :GetLibrary(name, silent)
+                    string? name = null;
+                    bool silent = false;
+                    if (args.Count >= 1 && args[0].Type == DataType.String) name = args[0].String;
+                    else if (args.Count >= 2 && args[1].Type == DataType.String) name = args[1].String;
+
+                    if (args.Count >= 2)
+                    {
+                        if (args[1].Type == DataType.Boolean) silent = args[1].Boolean;
+                        else if (args.Count >= 3 && args[2].Type == DataType.Boolean) silent = args[2].Boolean;
+                    }
+
+                    if (!string.IsNullOrEmpty(name))
+                    {
                         var dv = libsTbl.Get(name);
                         var mdv = minorsTbl.Get(name);
                         if (dv != null && dv.Type == DataType.Table)
                         {
-                            // return lib table and minor
                             if (mdv != null && mdv.Type == DataType.Number) return DynValue.NewTuple(DynValue.NewTable(dv.Table), mdv);
                             return DynValue.NewTable(dv.Table);
                         }
-                        // if not found and silent -> nil
-                        bool silent = false;
-                        if (args.Count >= 2 && args[1].Type == DataType.Boolean) silent = args[1].Boolean;
                         if (!silent) throw new ScriptRuntimeException($"Cannot find a library instance of {name}.");
                     }
                     return DynValue.Nil;
@@ -949,6 +1155,31 @@ namespace Flux
                 _script.Globals["LibStub"] = DynValue.NewTable(libStub);
                 // also mirror into our _libRegistry for compatibility
                 _libRegistry["LibStub"] = libStub;
+
+                // Diagnostic: report whether NewLibrary/GetLibrary are present and callable
+                try
+                {
+                    var newLibDv = libStub.Get("NewLibrary");
+                    if (newLibDv == null || newLibDv.Type == DataType.Nil)
+                    {
+                        EmitOutput("[LuaRunner-Diag] LibStub.NewLibrary is nil");
+                    }
+                    else
+                    {
+                        EmitOutput($"[LuaRunner-Diag] LibStub.NewLibrary type={newLibDv.Type}");
+                        try
+                        {
+                            // Try a harmless call to create a temporary lib and remove it
+                            var tmp = _script.Call(newLibDv.Function, DynValue.NewString("FluxTestLib"), DynValue.NewNumber(1));
+                            EmitOutput("[LuaRunner-Diag] LibStub.NewLibrary callable (test) returned: " + (tmp?.ToPrintString() ?? "(nil)"));
+                        }
+                        catch (Exception ex)
+                        {
+                            EmitOutput("[LuaRunner-Diag] LibStub.NewLibrary call failed: " + ex.Message);
+                        }
+                    }
+                }
+                catch { }
 
                 // Pre-register a minimal AceAddon-3.0 implementation
                 try
@@ -1261,9 +1492,10 @@ namespace Flux
                             var mtLoc = new Table(_script);
                             mtLoc.Set("__index", DynValue.NewCallback((c2, a2) =>
                             {
-                                if (a2.Count >= 2 && a2[2].Type == DataType.String)
+                                // __index called with (table, key)
+                                if (a2.Count >= 2 && a2[1].Type == DataType.String)
                                 {
-                                    return DynValue.NewString(a2[2].String);
+                                    return DynValue.NewString(a2[1].String);
                                 }
                                 return DynValue.NewString(string.Empty);
                             }));
@@ -1455,6 +1687,15 @@ namespace Flux
                 // Determine first vararg to pass: for library files, pass (MAJOR, MINOR).
                 var firstArg = firstVarArg ?? addonName;
 
+                // Diagnostic: report presence of key globals before executing chunk
+                try
+                {
+                    var cf = _script.Globals.Get("CreateFrame");
+                    var ls = _script.Globals.Get("LibStub");
+                    EmitOutput($"[LuaRunner-Diag] About to execute chunk='{chunkName}' CreateFrameType={cf?.Type} LibStubType={ls?.Type}");
+                }
+                catch { }
+
                 if (isLibraryFile)
                 {
                     // Libraries expect (MAJOR, MINOR)
@@ -1540,6 +1781,23 @@ namespace Flux
                     {
                         try
                         {
+                            // Skip problematic files that would overwrite our shims or require UI
+                            var fname = System.IO.Path.GetFileName(f);
+                            var skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                            {
+                                "LibStub.lua",
+                                "Ace3.lua",
+                                "ChatThrottleLib.lua",
+                                "AceGUIContainer-Window.lua",
+                                "AceGUIWidget-DropDown.lua",
+                                "AceGUIWidget-DropDown-Items.lua",
+                            };
+                            if (skip.Contains(fname))
+                            {
+                                EmitOutput($"[LuaRunner] Skipping preload of {fname}");
+                                continue;
+                            }
+
                             var code = System.IO.File.ReadAllText(f);
                             var libName = System.IO.Path.GetFileNameWithoutExtension(f);
                             var chunkRel = f;
