@@ -42,12 +42,15 @@ if f ~= nil then
     print(addonName .. ": mouse left frame")
   end)
 
+  local __update_acc = 0.0
   f:SetScript("OnUpdate", function(self, dt)
-    -- dt is seconds since last update; keep output light to avoid spam
+    -- dt is seconds since last update; throttle logging to once per second
     if dt and dt > 0 then
-      -- show a short periodic message (throttled by runtime frequency)
-      -- Commented out by default; uncomment to see continuous updates
-      -- print(string.format("%s: OnUpdate dt=%.3f", addonName, dt))
+      __update_acc = __update_acc + dt
+      if __update_acc >= 1.0 then
+        __update_acc = __update_acc % 1.0
+        print(string.format("%s: OnUpdate (acc=%.3f)", addonName, __update_acc))
+      end
     end
   end)
 end

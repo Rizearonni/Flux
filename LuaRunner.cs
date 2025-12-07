@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using MoonSharp.Interpreter;
 using MoonSharp.Interpreter.Interop;
 using System.Text.Json;
+using Avalonia.Media.Imaging;
+using Avalonia.Media;
 using Avalonia;
 
 namespace Flux
@@ -13,6 +15,8 @@ namespace Flux
         private Dictionary<string, List<Closure>> _eventHandlers = new();
         private Table _savedVarsTable;
         public string AddonName { get; }
+
+        public event EventHandler<string>? OnSavedVariablesChanged;
 
         public event EventHandler<string>? OnOutput;
 
@@ -28,17 +32,19 @@ namespace Flux
 
         private FrameManager? _frameManager;
 
-        public LuaRunner(string addonName, FrameManager? frameManager = null)
+        private readonly string? _addonFolder;
+
+        public LuaRunner(string addonName, FrameManager? frameManager = null, string? addonFolder = null)
         {
             _frameManager = frameManager;
             AddonName = addonName;
+            _addonFolder = addonFolder;
 
             // Create script with no core modules for sandboxing
             _script = new Script(CoreModules.None);
 
-            // Create saved variables table
-            _savedVarsTable = new Table(_script);
-            _script.Globals["SavedVariables"] = DynValue.NewTable(_savedVarsTable);
+            // Create saved variables table with metatable to detect writes
+            InitializeSavedVariablesTable(null);
 
             // Provide a safe 'print' function
             _script.Globals["print"] = DynValue.NewCallback((ctx, args) =>
@@ -218,24 +224,70 @@ namespace Flux
 
                 t.Set("SetBackdrop", DynValue.NewCallback((c, a) =>
                 {
-                    // Accept a color name string (e.g., "Red", "LightGray") and apply a Brush
+                    // Accept a color name string (e.g., "Red", "LightGray") or hex color (#RRGGBB) and apply a Brush
                     if (vf == null) return DynValue.Nil;
                     if (a.Count >= 1 && a[0].Type == DataType.String)
                     {
                         var colorName = a[0].String;
                         try
                         {
-                            // Try to find a Brushes.<Name> property
-                            var brushesType = typeof(Avalonia.Media.Brushes);
-                            var prop = brushesType.GetProperty(colorName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.IgnoreCase);
-                            if (prop != null)
+                            // Hex color #RRGGBB or #AARRGGBB
+                            if (!string.IsNullOrEmpty(colorName) && colorName.StartsWith("#"))
                             {
-                                var brush = prop.GetValue(null) as Avalonia.Media.IBrush;
-                                if (brush != null)
+                                try
                                 {
-                                    vf.BackdropBrush = brush;
+                                    var col = Avalonia.Media.Color.Parse(colorName);
+                                    vf.BackdropBrush = new SolidColorBrush(col);
                                     _frameManager?.UpdateVisual(vf);
                                 }
+                                catch { }
+                            }
+                            else
+                            {
+                                // Try to find a Brushes.<Name> property
+                                var brushesType = typeof(Avalonia.Media.Brushes);
+                                var prop = brushesType.GetProperty(colorName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.IgnoreCase);
+                                if (prop != null)
+                                {
+                                    var brush = prop.GetValue(null) as Avalonia.Media.IBrush;
+                                    if (brush != null)
+                                    {
+                                        vf.BackdropBrush = brush;
+                                        _frameManager?.UpdateVisual(vf);
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                    return DynValue.Nil;
+                }));
+
+                // Backdrop texture (image path relative to addon folder or absolute)
+                t.Set("SetBackdropTexture", DynValue.NewCallback((c, a) =>
+                {
+                    if (vf == null) return DynValue.Nil;
+                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    {
+                        var path = a[0].String;
+                        try
+                        {
+                            string resolved = path;
+                            if (!System.IO.Path.IsPathRooted(path) && !string.IsNullOrEmpty(_addonFolder))
+                            {
+                                resolved = System.IO.Path.GetFullPath(System.IO.Path.Combine(_addonFolder, path));
+                            }
+                            if (System.IO.File.Exists(resolved))
+                            {
+                                // Create an ImageBrush from the bitmap
+                                try
+                                {
+                                    var bmp = new Bitmap(resolved);
+                                    var ib = new ImageBrush(bmp);
+                                    vf.BackdropBrush = ib;
+                                    _frameManager?.UpdateVisual(vf);
+                                }
+                                catch { }
                             }
                         }
                         catch { }
@@ -363,12 +415,15 @@ namespace Flux
 
         public void LoadSavedVariables(Dictionary<string, object?> dict)
         {
-            _savedVarsTable = new Table(_script);
-            foreach (var kv in dict)
+            // Populate backing saved-variables table
+            if (_savedVarsTable == null) InitializeSavedVariablesTable(dict);
+            else
             {
-                _savedVarsTable.Set(kv.Key, ConvertToDynValue(kv.Value));
+                foreach (var kv in dict)
+                {
+                    _savedVarsTable.Set(kv.Key, ConvertToDynValue(kv.Value));
+                }
             }
-            _script.Globals["SavedVariables"] = DynValue.NewTable(_savedVarsTable);
         }
 
         public Dictionary<string, object?> GetSavedVariablesAsObject()
@@ -427,6 +482,58 @@ namespace Flux
                 return dict;
             }
             return v.ToString();
+        }
+
+        private void InitializeSavedVariablesTable(Dictionary<string, object?>? initial)
+        {
+            // backing storage
+            _savedVarsTable = new Table(_script);
+            if (initial != null)
+            {
+                foreach (var kv in initial)
+                {
+                    _savedVarsTable.Set(kv.Key, ConvertToDynValue(kv.Value));
+                }
+            }
+
+            // proxy table exposed to Lua with metatable to trap writes
+            var proxy = new Table(_script);
+            var mt = new Table(_script);
+
+            // __index: return value from backing table
+            mt.Set("__index", DynValue.NewCallback((ctx, args) =>
+            {
+                if (args.Count >= 2)
+                {
+                    var key = args[1];
+                    if (key.Type == DataType.String)
+                    {
+                        var v = _savedVarsTable.Get(key.String);
+                        return v ?? DynValue.Nil;
+                    }
+                }
+                return DynValue.Nil;
+            }));
+
+            // __newindex: set in backing table and notify host
+            mt.Set("__newindex", DynValue.NewCallback((ctx, args) =>
+            {
+                if (args.Count >= 3)
+                {
+                    var key = args[1];
+                    var val = args[2];
+                    if (key.Type == DataType.String)
+                    {
+                        _savedVarsTable.Set(key.String, val);
+                        try { OnSavedVariablesChanged?.Invoke(this, AddonName); } catch { }
+                    }
+                }
+                return DynValue.Nil;
+            }));
+
+            proxy.MetaTable = mt;
+
+            _script.Globals["SavedVariables"] = DynValue.NewTable(proxy);
         }
 
         private (double, double) AnchorToOffset(string anchor, double w, double h)

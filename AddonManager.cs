@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Timers;
 
 namespace Flux
 {
@@ -11,6 +12,7 @@ namespace Flux
         private readonly string _dataDir;
         private readonly Dictionary<string, LuaRunner> _runners = new();
         private readonly FrameManager? _frameManager;
+        private readonly Dictionary<string, System.Timers.Timer> _saveTimers = new();
 
         public AddonManager(FrameManager? frameManager = null)
         {
@@ -27,9 +29,15 @@ namespace Flux
             if (!Directory.Exists(folderPath)) return null;
 
             var addonName = Path.GetFileName(folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-            var runner = new LuaRunner(addonName, _frameManager);
+            var runner = new LuaRunner(addonName, _frameManager, folderPath);
             if (outputCallback != null)
                 runner.OnOutput += outputCallback;
+
+            // Auto-save when SavedVariables change (debounced)
+            runner.OnSavedVariablesChanged += (s, name) =>
+            {
+                try { ScheduleSave(name); } catch { }
+            };
 
             // Load saved variables if present
             var saveFile = Path.Combine(_dataDir, addonName + ".json");
@@ -65,6 +73,45 @@ namespace Flux
             var opts = new JsonSerializerOptions { WriteIndented = true };
             var json = JsonSerializer.Serialize(obj, opts);
             File.WriteAllText(saveFile, json);
+        }
+
+        private void ScheduleSave(string addonName, double debounceMs = 2000)
+        {
+            lock (_saveTimers)
+            {
+                if (_saveTimers.TryGetValue(addonName, out var existing))
+                {
+                    // reset timer
+                    existing.Stop();
+                    existing.Interval = debounceMs;
+                    existing.Start();
+                    return;
+                }
+
+                var timer = new System.Timers.Timer(debounceMs) { AutoReset = false };
+                timer.Elapsed += (s, e) =>
+                {
+                    try
+                    {
+                        SaveSavedVariables(addonName);
+                    }
+                    catch { }
+                    finally
+                    {
+                        lock (_saveTimers)
+                        {
+                            if (_saveTimers.TryGetValue(addonName, out var t) && t == timer)
+                            {
+                                _saveTimers.Remove(addonName);
+                                try { t.Dispose(); } catch { }
+                            }
+                        }
+                    }
+                };
+
+                _saveTimers[addonName] = timer;
+                timer.Start();
+            }
         }
 
         public void TriggerEvent(string eventName, params object?[] args)
