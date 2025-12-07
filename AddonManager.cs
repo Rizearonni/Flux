@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Xml.Linq;
 using System.Timers;
 
 namespace Flux
@@ -53,13 +54,170 @@ namespace Flux
                 catch { /* ignore errors for prototype */ }
             }
 
-            // Execute .lua files in alphabetical order
-            var luaFiles = Directory.GetFiles(folderPath, "*.lua").OrderBy(f => f);
-            foreach (var f in luaFiles)
+            // Determine files to execute. Prefer a .toc file (preserves addon-defined order).
+            var filesToRun = new List<string>();
+            try
             {
-                var code = File.ReadAllText(f);
-                runner.RunScriptFromString(code, addonName);
+                // Try to find a TOC file: prefer <addonName>.toc, otherwise any .toc in the root
+                var tocFiles = Directory.GetFiles(folderPath, "*.toc", SearchOption.TopDirectoryOnly);
+                string? toc = tocFiles.FirstOrDefault(f => Path.GetFileNameWithoutExtension(f).Equals(addonName, StringComparison.OrdinalIgnoreCase))
+                              ?? tocFiles.FirstOrDefault();
+
+                if (toc != null)
+                {
+                    outputCallback?.Invoke(this, $"[AddonManager] Found TOC: {Path.GetFileName(toc)}");
+                    var lines = File.ReadAllLines(toc);
+                    foreach (var raw in lines)
+                    {
+                        var line = raw.Trim();
+                        if (string.IsNullOrEmpty(line)) continue;
+                        if (line.StartsWith("#")) continue; // comments/metadata
+
+                        // Toc entries may include additional parameters separated by whitespace; take first token
+                        var token = line.Split((char[])null, StringSplitOptions.RemoveEmptyEntries)[0];
+                        // Only consider .lua files for now
+                        if (!token.EndsWith(".lua", StringComparison.OrdinalIgnoreCase)) continue;
+
+                        var resolved = Path.GetFullPath(Path.Combine(folderPath, token.Replace('/', Path.DirectorySeparatorChar)));
+                        if (File.Exists(resolved))
+                        {
+                            filesToRun.Add(resolved);
+                            outputCallback?.Invoke(this, $"[AddonManager] TOC -> enqueue: {token}");
+                        }
+                        else
+                        {
+                            outputCallback?.Invoke(this, $"[AddonManager] TOC referenced file not found: {token}");
+                        }
+                    }
+                }
+                else
+                {
+                    // No TOC: fall back to loading all .lua files recursively in deterministic order
+                    outputCallback?.Invoke(this, "[AddonManager] No TOC found — loading all .lua files recursively");
+                    filesToRun.AddRange(Directory.GetFiles(folderPath, "*.lua", SearchOption.AllDirectories).OrderBy(f => f));
+                }
             }
+            catch (Exception ex)
+            {
+                outputCallback?.Invoke(this, $"[AddonManager] Error while locating files: {ex.Message}");
+                // fallback
+                filesToRun.AddRange(Directory.GetFiles(folderPath, "*.lua", SearchOption.AllDirectories).OrderBy(f => f));
+            }
+
+            // Execute collected files in order
+            foreach (var f in filesToRun)
+            {
+                try
+                {
+                    var rel = Path.GetRelativePath(folderPath, f);
+                    outputCallback?.Invoke(this, $"[AddonManager] Executing: {rel}");
+                    var code = File.ReadAllText(f);
+                    runner.RunScriptFromString(code, addonName);
+                }
+                catch (Exception ex)
+                {
+                    outputCallback?.Invoke(this, $"[AddonManager] Failed to execute {f}: {ex.Message}");
+                }
+            }
+
+            // Parse XML UI files (simple support) and instantiate frames before returning
+            try
+            {
+                var xmlFiles = Directory.GetFiles(folderPath, "*.xml", SearchOption.AllDirectories).OrderBy(f => f);
+                foreach (var xf in xmlFiles)
+                {
+                    outputCallback?.Invoke(this, $"[AddonManager] Parsing XML UI: {Path.GetRelativePath(folderPath, xf)}");
+                    try
+                    {
+                        var doc = XDocument.Load(xf);
+                        // Find Frame elements
+                        var frames = doc.Descendants().Where(e => string.Equals(e.Name.LocalName, "Frame", StringComparison.OrdinalIgnoreCase));
+                        foreach (var fe in frames)
+                        {
+                            try
+                            {
+                                // Create a visual frame via FrameManager
+                                if (_frameManager == null) break;
+                                var vf = _frameManager.CreateFrame(runner);
+
+                                // Width/Height attributes
+                                var wAttr = fe.Attribute("width") ?? fe.Attribute("Width");
+                                var hAttr = fe.Attribute("height") ?? fe.Attribute("Height");
+                                if (wAttr != null && double.TryParse(wAttr.Value, out var w)) vf.Width = w;
+                                if (hAttr != null && double.TryParse(hAttr.Value, out var h)) vf.Height = h;
+
+                                // Anchor: look for first Anchor element under Anchors
+                                var anchor = fe.Descendants().FirstOrDefault(e => string.Equals(e.Name.LocalName, "Anchor", StringComparison.OrdinalIgnoreCase));
+                                if (anchor != null)
+                                {
+                                    var xAttr = anchor.Attribute("x") ?? anchor.Attribute("X");
+                                    var yAttr = anchor.Attribute("y") ?? anchor.Attribute("Y");
+                                    if (xAttr != null && double.TryParse(xAttr.Value, out var ax)) vf.X = ax;
+                                    if (yAttr != null && double.TryParse(yAttr.Value, out var ay)) vf.Y = ay;
+                                }
+
+                                // Backdrop: find Backdrop element and bgFile attribute
+                                var backdrop = fe.Descendants().FirstOrDefault(e => string.Equals(e.Name.LocalName, "Backdrop", StringComparison.OrdinalIgnoreCase));
+                                if (backdrop != null)
+                                {
+                                    var bg = backdrop.Attribute("bgFile") ?? backdrop.Attribute("bg") ?? backdrop.Attribute("file");
+                                    if (bg != null && !string.IsNullOrEmpty(bg.Value))
+                                    {
+                                        var tex = bg.Value.Replace('/', Path.DirectorySeparatorChar);
+                                        var resolved = Path.GetFullPath(Path.Combine(folderPath, tex));
+                                        if (File.Exists(resolved))
+                                        {
+                                            try
+                                            {
+                                                var bmp = new Avalonia.Media.Imaging.Bitmap(resolved);
+                                                vf.BackdropBitmap = bmp;
+                                                // edgeSize/insets
+                                                int edge = 0;
+                                                var edgeAttr = backdrop.Attribute("edgeSize") ?? backdrop.Attribute("edge") ?? backdrop.Attribute("edgeSizePixels");
+                                                if (edgeAttr != null) int.TryParse(edgeAttr.Value, out edge);
+                                                if (edge > 0)
+                                                {
+                                                    vf.NinePatchInsets = (edge, edge, edge, edge);
+                                                    vf.UseNinePatch = true;
+                                                }
+                                                else
+                                                {
+                                                    vf.BackdropBrush = new Avalonia.Media.ImageBrush(bmp) { Stretch = Avalonia.Media.Stretch.Fill };
+                                                    vf.UseNinePatch = false;
+                                                }
+
+                                                var tileAttr = backdrop.Attribute("tile");
+                                                if (tileAttr != null && bool.TryParse(tileAttr.Value, out var tile)) vf.TileBackdrop = tile;
+                                            }
+                                            catch { }
+                                        }
+                                    }
+                                }
+
+                                // Regions: simple FontString -> Text
+                                var fs = fe.Descendants().FirstOrDefault(e => string.Equals(e.Name.LocalName, "FontString", StringComparison.OrdinalIgnoreCase));
+                                if (fs != null)
+                                {
+                                    var text = fs.Attribute("text")?.Value ?? fs.Attribute("Text")?.Value;
+                                    if (!string.IsNullOrEmpty(text)) vf.Text = text;
+                                }
+
+                                // Final visual update
+                                _frameManager.UpdateVisual(vf);
+                            }
+                            catch (Exception ex)
+                            {
+                                outputCallback?.Invoke(this, $"[AddonManager] Failed to instantiate frame from XML: {ex.Message}");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        outputCallback?.Invoke(this, $"[AddonManager] XML parse error: {ex.Message}");
+                    }
+                }
+            }
+            catch { }
 
             _runners[addonName] = runner;
             return runner;
