@@ -6,6 +6,7 @@ using Avalonia.Controls.Shapes;
 using Avalonia.Media;
 using Avalonia;
 using Avalonia.Threading;
+using Avalonia.Input;
 using MoonSharp.Interpreter;
 
 namespace Flux
@@ -53,6 +54,8 @@ namespace Flux
     {
         private readonly Canvas _canvas;
         private readonly List<VisualFrame> _frames = new();
+        private DateTime _lastUpdate = DateTime.UtcNow;
+        private VisualFrame? _hoveredFrame;
 
         public IReadOnlyList<VisualFrame> Frames => _frames.AsReadOnly();
 
@@ -64,17 +67,58 @@ namespace Flux
             {
                 try
                 {
+                    var now = DateTime.UtcNow;
+                    var delta = (now - _lastUpdate).TotalSeconds;
+                    _lastUpdate = now;
+
                     foreach (var f in _frames)
                     {
                         if (f.OnUpdate != null)
                         {
-                            try { f.Owner.InvokeClosure(f.OnUpdate); } catch { }
+                            try { f.Owner.InvokeClosure(f.OnUpdate, delta); } catch { }
                         }
                     }
                 }
                 catch { }
                 return true; // keep running
             }, TimeSpan.FromMilliseconds(100));
+
+            // Pointer handlers on the canvas to detect enter/leave and clicks
+            _canvas.PointerMoved += (s, e) =>
+            {
+                try
+                {
+                    var p = e.GetPosition(_canvas);
+                    var hit = HitTest(p);
+                    if (hit != _hoveredFrame)
+                    {
+                        if (_hoveredFrame != null)
+                        {
+                            try { if (_hoveredFrame.OnLeave != null) _hoveredFrame.Owner.InvokeClosure(_hoveredFrame.OnLeave); } catch { }
+                        }
+                        _hoveredFrame = hit;
+                        if (hit != null)
+                        {
+                            try { if (hit.OnEnter != null) hit.Owner.InvokeClosure(hit.OnEnter); } catch { }
+                        }
+                    }
+                }
+                catch { }
+            };
+
+            _canvas.PointerPressed += (s, e) =>
+            {
+                try
+                {
+                    var p = e.GetPosition(_canvas);
+                    var hit = HitTest(p);
+                    if (hit != null)
+                    {
+                        try { if (hit.OnClick != null) hit.Owner.InvokeClosure(hit.OnClick); } catch { }
+                    }
+                }
+                catch { }
+            };
         }
 
         public VisualFrame CreateFrame(LuaRunner owner)
@@ -89,6 +133,8 @@ namespace Flux
                 if (vf.VisualText != null)
                     _canvas.Children.Add(vf.VisualText);
                 UpdateVisual(vf);
+
+                // Note: pointer events are handled at the canvas level for hit-testing
             });
 
             return vf;
