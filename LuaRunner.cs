@@ -13,6 +13,9 @@ namespace Flux
 {
     public class LuaRunner
     {
+        // preserved closure for preregistered AceAddon.NewAddon so library-created tables
+        // that overwrite our registry still get a callable NewAddon injected.
+        private DynValue _preregisteredAceAddonNewAddon = null;
         private readonly Dictionary<string, Table> _addonNamespaces = new();
         private Script _script;
         private FrameManager? _frameManager;
@@ -39,6 +42,8 @@ namespace Flux
             try { Console.WriteLine(s); } catch { }
         }
         private readonly string? _addonFolder;
+        // Public accessor for the addon folder the runner was created with
+        public string? AddonFolder => _addonFolder;
         public bool IsClassic { get; private set; }
         public int InterfaceVersion { get; private set; }
         public LuaRunner(string addonName, FrameManager? frameManager = null, string? addonFolder = null, int interfaceVersion = 0, bool isClassic = false)
@@ -272,7 +277,7 @@ namespace Flux
             // Provide ChatEdit_InsertLink stub (used by AceGUI EditBox)
             try { _script.Globals["ChatEdit_InsertLink"] = DynValue.NewCallback((c, a) => DynValue.Nil); } catch { }
 
-            // Provide GetTime and GetFramerate shims used by many libraries (ChatThrottleLib expects these)
+                // Provide GetTime and GetFramerate shims used by many libraries (ChatThrottleLib expects these)
             try
             {
                 _script.Globals["GetTime"] = DynValue.NewCallback((c, a) =>
@@ -291,6 +296,33 @@ namespace Flux
                 // Provide SendChatMessage / SendAddonMessage stubs so libraries can call them
                 _script.Globals["SendChatMessage"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(true));
                 _script.Globals["SendAddonMessage"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(true));
+
+                // Provide a C_ChatInfo table with SendChatMessage/SendAddonMessage wrappers
+                try
+                {
+                    var cchat = new Table(_script);
+                    // Use the global functions if present, otherwise no-op
+                    var sendChat = _script.Globals.Get("SendChatMessage");
+                    var sendAddon = _script.Globals.Get("SendAddonMessage");
+                    if (sendChat != null) cchat.Set("SendChatMessage", sendChat);
+                    if (sendAddon != null) cchat.Set("SendAddonMessage", sendAddon);
+                    // Logged variant falls back to SendAddonMessage
+                    if (sendAddon != null) cchat.Set("SendAddonMessageLogged", sendAddon);
+                    _script.Globals["C_ChatInfo"] = DynValue.NewTable(cchat);
+                }
+                catch { }
+
+                // Provide a minimal C_BattleNet shim with SendGameData
+                try
+                {
+                    var cbn = new Table(_script);
+                    cbn.Set("SendGameData", DynValue.NewCallback((c2, a2) => DynValue.NewBoolean(true)));
+                    _script.Globals["C_BattleNet"] = DynValue.NewTable(cbn);
+                }
+                catch { }
+
+                // Provide InCombatLockdown shim so UI dialogs don't nil-call
+                try { _script.Globals["InCombatLockdown"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(false)); } catch { }
             }
             catch { }
 
@@ -465,6 +497,23 @@ namespace Flux
             try { _script.Globals["GetAddOnMetadata"] = DynValue.NewCallback((c, a) => DynValue.NewString(string.Empty)); } catch { }
             try { _script.Globals["GetAddOnInfo"] = DynValue.NewCallback((c, a) => DynValue.NewTuple(DynValue.NewString(""), DynValue.NewBoolean(false))); } catch { }
             try { _script.Globals["UnitName"] = DynValue.NewCallback((c, a) => DynValue.NewString("Player")); } catch { }
+            // Additional defensive shims used by many Ace libraries and DB code
+            try { _script.Globals["Ambiguate"] = DynValue.NewCallback((c, a) => { if (a.Count>=1 && a[0].Type==DataType.String) return DynValue.NewString(a[0].String); return DynValue.NewString(string.Empty); }); } catch { }
+            try { 
+                var strTbl = _script.Globals.Get("string");
+                if (strTbl != null && strTbl.Type == DataType.Table)
+                {
+                    var matchFn = strTbl.Table.Get("match");
+                    if (matchFn != null) _script.Globals["match"] = matchFn;
+                }
+            } catch { }
+
+            try { _script.Globals["GetRealmName"] = DynValue.NewCallback((c,a) => DynValue.NewString("LocalRealm")); } catch { }
+            try { _script.Globals["GetCurrentRegion"] = DynValue.NewCallback((c,a) => DynValue.NewNumber(1)); } catch { }
+            try { _script.Globals["GetCurrentRegionName"] = DynValue.NewCallback((c,a) => DynValue.NewString("US")); } catch { }
+            try { _script.Globals["UnitClass"] = DynValue.NewCallback((c,a) => DynValue.NewTuple(DynValue.NewString("Warrior"), DynValue.NewString("WARRIOR"))); } catch { }
+            try { _script.Globals["UnitRace"] = DynValue.NewCallback((c,a) => DynValue.NewTuple(DynValue.NewString("Human"), DynValue.NewString("Human"))); } catch { }
+            try { _script.Globals["UnitFactionGroup"] = DynValue.NewCallback((c,a) => DynValue.NewString("Alliance")); } catch { }
             // table helpers commonly expected by WoW addons
             try
             {
@@ -569,6 +618,67 @@ namespace Flux
 
             // Initialize a minimal LibStub implementation so embedded libs (Ace3) can register
             InitializeLibStub();
+
+            // Pre-create ChatThrottleLib table so libraries that capture it at load
+            // time (like AceComm) get a stable table that will be populated when
+            // the real ChatThrottleLib chunk runs.
+            try
+            {
+                if (_script.Globals.Get("ChatThrottleLib") == null || _script.Globals.Get("ChatThrottleLib").IsNil())
+                {
+                    var ctlTbl = new Table(_script);
+                    // provide minimal stubs expected by other libs
+                    ctlTbl.Set("SendChatMessage", DynValue.NewCallback((c, a) => DynValue.NewBoolean(true)));
+                    ctlTbl.Set("SendAddonMessage", DynValue.NewCallback((c, a) => DynValue.NewBoolean(true)));
+                    _script.Globals["ChatThrottleLib"] = DynValue.NewTable(ctlTbl);
+                }
+            }
+            catch { }
+
+            // Create a visible Minimap global so libraries like LibDBIcon can hook scripts
+            try
+            {
+                VisualFrame? minimapVf = null;
+                if (_frameManager != null) minimapVf = _frameManager.CreateFrame(this);
+                if (minimapVf != null)
+                {
+                    minimapVf.Text = "Minimap";
+                    minimapVf.Width = 100; minimapVf.Height = 100;
+                    _frameManager?.UpdateVisual(minimapVf);
+                }
+
+                var mmTbl = new Table(_script);
+                // HookScript/SetScript store closures to run on enter/leave
+                mmTbl.Set("HookScript", DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 2 && (a[1].Type == DataType.Function || a[1].Type == DataType.ClrFunction) && a[0].Type == DataType.String)
+                    {
+                        var evt = a[0].String;
+                        if (evt == "OnEnter") { if (minimapVf != null) minimapVf.OnEnter = a[1].Function; }
+                        else if (evt == "OnLeave") { if (minimapVf != null) minimapVf.OnLeave = a[1].Function; }
+                    }
+                    return DynValue.Nil;
+                }));
+
+                mmTbl.Set("SetScript", DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 2 && (a[1].Type == DataType.Function || a[1].Type == DataType.ClrFunction) && a[0].Type == DataType.String)
+                    {
+                        var evt = a[0].String;
+                        if (evt == "OnEnter") { if (minimapVf != null) minimapVf.OnEnter = a[1].Function; }
+                        else if (evt == "OnLeave") { if (minimapVf != null) minimapVf.OnLeave = a[1].Function; }
+                    }
+                    return DynValue.Nil;
+                }));
+
+                mmTbl.Set("Ping", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                mmTbl.Set("GetMinimapShape", DynValue.NewCallback((c, a) => DynValue.NewString("ROUND")));
+                mmTbl.Set("GetZoom", DynValue.NewCallback((c, a) => DynValue.NewNumber(1)));
+                mmTbl.Set("SetZoom", DynValue.NewCallback((c, a) => DynValue.Nil));
+
+                _script.Globals["Minimap"] = DynValue.NewTable(mmTbl);
+            }
+            catch { }
 
             // Provide a safe 'print' function
             _script.Globals["print"] = DynValue.NewCallback((ctx, args) =>
@@ -706,6 +816,12 @@ namespace Flux
                     vf.Visible = true;
                         _frameManager?.UpdateVisual(vf);
                     return DynValue.Nil;
+                }));
+
+                t.Set("IsVisible", DynValue.NewCallback((c, a) =>
+                {
+                    if (vf == null) return DynValue.NewBoolean(false);
+                    return DynValue.NewBoolean(vf.Visible);
                 }));
 
                 t.Set("Hide", DynValue.NewCallback((c, a) =>
@@ -932,6 +1048,315 @@ namespace Flux
                     return DynValue.Nil;
                 }));
 
+                    // Common UI frame helpers often used by AceConfig and widgets
+                    t.Set("EnableMouse", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                    t.Set("SetFrameStrata", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                    t.Set("SetFrameLevel", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                    t.Set("SetFixedFrameStrata", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                    t.Set("SetFixedFrameLevel", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                    t.Set("SetPropagateKeyboardInput", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+
+                    // CreateFontString stub: returns a small object supporting SetSize/SetPoint/SetText/Show/Hide
+                    DynValue createFontStringFn = DynValue.NewCallback((c, a) =>
+                    {
+                        EmitOutput("[LuaRunner-Diag] CreateFontString called");
+                        var ft = new Table(_script);
+                        ft.Set("SetSize", DynValue.NewCallback((c2, a2) => { return DynValue.Nil; }));
+                        ft.Set("SetPoint", DynValue.NewCallback((c2, a2) => { return DynValue.Nil; }));
+                        ft.Set("SetText", DynValue.NewCallback((c2, a2) =>
+                        {
+                            try
+                            {
+                                if (a2 != null && a2.Count >= 1 && a2[0].Type == DataType.String)
+                                {
+                                    if (vf != null) vf.Text = a2[0].String;
+                                    _frameManager?.UpdateVisual(vf);
+                                }
+                            }
+                            catch { }
+                            return DynValue.Nil;
+                        }));
+                        ft.Set("Show", DynValue.NewCallback((c2, a2) => DynValue.Nil));
+                        ft.Set("Hide", DynValue.NewCallback((c2, a2) => DynValue.Nil));
+                        return DynValue.NewTable(ft);
+                    });
+                    t.Set("CreateFontString", createFontStringFn);
+
+                    // Font object setters used by UI widgets
+                    t.Set("SetNormalFontObject", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                    t.Set("SetHighlightFontObject", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+
+                    // Helper to create a lightweight texture object with SetTexCoord/SetTexture
+                    Func<DynValue> makeTexture = () =>
+                    {
+                        var tex = new Table(_script);
+                        var setTexCoordFn = DynValue.NewCallback((c2, a2) => DynValue.Nil);
+                        tex.Set("SetTexCoord", setTexCoordFn);
+                        tex.Set("SetTexture", DynValue.NewCallback((c2, a2) => DynValue.Nil));
+
+                        // Provide a __call metamethod so defensive callers that try to call
+                        // the texture object (unexpected but some code paths may) get
+                        // the texture table returned and chaining works.
+                        try
+                        {
+                            var mt = new Table(_script);
+                            mt.Set("__call", DynValue.NewCallback((c2, a2) => DynValue.NewTable(tex)));
+                            tex.MetaTable = mt;
+                        }
+                        catch { }
+
+                        return DynValue.NewTable(tex);
+                    };
+
+                    // Simple texture helpers so widgets can call SetNormalTexture/GetNormalTexture and use :SetTexCoord()
+                    t.Set("SetNormalTexture", DynValue.NewCallback((c, a) =>
+                    {
+                        try
+                        {
+                            // Accept numeric texture IDs or strings; always return a texture table
+                            EmitOutput($"[LuaRunner-Diag] SetNormalTexture called for frame={vf?.Id} args={a.Count}");
+                            var texDv = makeTexture();
+                            t.Set("__normalTexture", texDv);
+                            EmitOutput($"[LuaRunner-Diag] SetNormalTexture stored __normalTexture for frame={vf?.Id}");
+                            return texDv;
+                        }
+                        catch { return DynValue.Nil; }
+                    }));
+
+                    t.Set("GetNormalTexture", DynValue.NewCallback((c, a) =>
+                    {
+                        try {
+                            var v = t.Get("__normalTexture");
+                            EmitOutput($"[LuaRunner-Diag] GetNormalTexture for frame={vf?.Id} returning: { (v==null?"(null)":v.Type.ToString()) }");
+                            // If missing or not a table, create a defensive texture object and store it
+                            if (v == null || v.Type == DataType.Nil || v.Type != DataType.Table)
+                            {
+                                var texDv = makeTexture();
+                                t.Set("__normalTexture", texDv);
+                                EmitOutput($"[LuaRunner-Diag] GetNormalTexture created fallback texture for frame={vf?.Id}");
+                                // ensure SetTexCoord present on the newly created texture
+                                try { texDv.Table.Set("SetTexCoord", DynValue.NewCallback((c2, a2) => DynValue.Nil)); } catch { }
+                                return texDv;
+                            }
+                            // Ensure SetTexCoord exists on the returned texture table and is callable
+                            try
+                            {
+                                var inner = v.Table;
+                                var s = inner.Get("SetTexCoord");
+                                if (s == null || s.Type == DataType.Nil || !(s.Type == DataType.Function || s.Type == DataType.ClrFunction))
+                                {
+                                    var fn = DynValue.NewCallback((c2, a2) => DynValue.Nil);
+                                    inner.Set("SetTexCoord", fn);
+                                    // ensure __call metamethod returns the texture table so chaining works
+                                    try
+                                    {
+                                        var mt = inner.MetaTable ?? new Table(_script);
+                                        mt.Set("__call", DynValue.NewCallback((c2, a2) => DynValue.NewTable(inner)));
+                                        inner.MetaTable = mt;
+                                    }
+                                    catch { }
+                                    EmitOutput($"[LuaRunner-Diag] Injected fallback SetTexCoord into texture for frame={vf?.Id}");
+                                }
+                                else
+                                {
+                                    EmitOutput($"[LuaRunner-Diag] Existing SetTexCoord type={s.Type} for frame={vf?.Id}");
+                                }
+                            }
+                            catch (Exception ex) { EmitOutput($"[LuaRunner-Diag] GetNormalTexture inner-check exception: {ex.Message}"); }
+                            return v ?? DynValue.Nil;
+                        } catch (Exception ex) { EmitOutput($"[LuaRunner-Diag] GetNormalTexture exception: {ex.Message}"); return DynValue.Nil; }
+                    }));
+
+                    t.Set("SetPushedTexture", DynValue.NewCallback((c, a) =>
+                    {
+                        try
+                        {
+                            EmitOutput($"[LuaRunner-Diag] SetPushedTexture called for frame={vf?.Id} args={a.Count}");
+                            var texDv = makeTexture();
+                            t.Set("__pushedTexture", texDv);
+                            EmitOutput($"[LuaRunner-Diag] SetPushedTexture stored __pushedTexture for frame={vf?.Id}");
+                            return texDv;
+                        }
+                        catch { return DynValue.Nil; }
+                    }));
+
+                    t.Set("GetPushedTexture", DynValue.NewCallback((c, a) =>
+                    {
+                        try {
+                            var v = t.Get("__pushedTexture");
+                            EmitOutput($"[LuaRunner-Diag] GetPushedTexture for frame={vf?.Id} returning: { (v==null?"(null)":v.Type.ToString()) }");
+                            if (v == null || v.Type == DataType.Nil || v.Type != DataType.Table)
+                            {
+                                var texDv = makeTexture();
+                                t.Set("__pushedtexture", texDv); // small tolerance if callers use different casing
+                                t.Set("__pushedTexture", texDv);
+                                EmitOutput($"[LuaRunner-Diag] GetPushedTexture created fallback texture for frame={vf?.Id}");
+                                try { texDv.Table.Set("SetTexCoord", DynValue.NewCallback((c2, a2) => DynValue.Nil)); } catch { }
+                                return texDv;
+                            }
+                            try
+                            {
+                                var inner = v.Table;
+                                var s = inner.Get("SetTexCoord");
+                                if (s == null || s.Type == DataType.Nil || !(s.Type == DataType.Function || s.Type == DataType.ClrFunction))
+                                {
+                                    var fn = DynValue.NewCallback((c2, a2) => DynValue.Nil);
+                                    inner.Set("SetTexCoord", fn);
+                                    try
+                                    {
+                                        var mt = inner.MetaTable ?? new Table(_script);
+                                        mt.Set("__call", DynValue.NewCallback((c2, a2) => DynValue.NewTable(inner)));
+                                        inner.MetaTable = mt;
+                                    }
+                                    catch { }
+                                    EmitOutput($"[LuaRunner-Diag] Injected fallback SetTexCoord into pushed texture for frame={vf?.Id}");
+                                }
+                                else
+                                {
+                                    EmitOutput($"[LuaRunner-Diag] Existing pushed SetTexCoord type={s.Type} for frame={vf?.Id}");
+                                }
+                            }
+                            catch (Exception ex) { EmitOutput($"[LuaRunner-Diag] GetPushedTexture inner-check exception: {ex.Message}"); }
+                            return v ?? DynValue.Nil;
+                        } catch (Exception ex) { EmitOutput($"[LuaRunner-Diag] GetPushedTexture exception: {ex.Message}"); return DynValue.Nil; }
+                    }));
+
+                    t.Set("SetHighlightTexture", DynValue.NewCallback((c, a) =>
+                    {
+                        try
+                        {
+                            var texDv = makeTexture();
+                            // normalize key name to __highlightTexture to match GetHighlightTexture
+                            t.Set("__highlightTexture", texDv);
+                            return texDv;
+                        }
+                        catch { return DynValue.Nil; }
+                    }));
+
+                    t.Set("GetHighlightTexture", DynValue.NewCallback((c, a) =>
+                    {
+                        try {
+                            var v = t.Get("__highlightTexture");
+                            EmitOutput($"[LuaRunner-Diag] GetHighlightTexture returning: { (v==null?"(null)":v.Type.ToString()) }");
+                            if (v == null || v.Type == DataType.Nil || v.Type != DataType.Table)
+                            {
+                                var texDv = makeTexture();
+                                t.Set("__highlighttexture", texDv);
+                                t.Set("__highlightTexture", texDv);
+                                EmitOutput($"[LuaRunner-Diag] GetHighlightTexture created fallback texture for frame={vf?.Id}");
+                                try { texDv.Table.Set("SetTexCoord", DynValue.NewCallback((c2, a2) => DynValue.Nil)); } catch { }
+                                return texDv;
+                            }
+                            try
+                            {
+                                var inner = v.Table;
+                                var s = inner.Get("SetTexCoord");
+                                if (s == null || s.Type == DataType.Nil || !(s.Type == DataType.Function || s.Type == DataType.ClrFunction))
+                                {
+                                    var fn = DynValue.NewCallback((c2, a2) => DynValue.Nil);
+                                    inner.Set("SetTexCoord", fn);
+                                    try
+                                    {
+                                        var mt = inner.MetaTable ?? new Table(_script);
+                                        mt.Set("__call", DynValue.NewCallback((c2, a2) => DynValue.NewTable(inner)));
+                                        inner.MetaTable = mt;
+                                    }
+                                    catch { }
+                                    EmitOutput($"[LuaRunner-Diag] Injected fallback SetTexCoord into highlight texture for frame={vf?.Id}");
+                                }
+                                else
+                                {
+                                    EmitOutput($"[LuaRunner-Diag] Existing highlight SetTexCoord type={s.Type} for frame={vf?.Id}");
+                                }
+                            }
+                            catch (Exception ex) { EmitOutput($"[LuaRunner-Diag] GetHighlightTexture inner-check exception: {ex.Message}"); }
+                            return v ?? DynValue.Nil;
+                        } catch (Exception ex) { EmitOutput($"[LuaRunner-Diag] GetHighlightTexture exception: {ex.Message}"); return DynValue.Nil; }
+                    }));
+
+                    // Common helper: mirror SetAllPoints to size/position the visual frame to its parent
+                    t.Set("SetAllPoints", DynValue.NewCallback((c, a) =>
+                    {
+                        if (vf == null) return DynValue.Nil;
+                        try
+                        {
+                            VisualFrame? parentVf = null;
+                            if (a.Count >= 1 && a[0].Type == DataType.Table)
+                            {
+                                var idV = a[0].Table.Get("__id");
+                                if (idV != null && idV.Type == DataType.String) parentVf = _frameManager?.FindById(idV.String);
+                            }
+                            if (parentVf != null)
+                            {
+                                vf.X = parentVf.X;
+                                vf.Y = parentVf.Y;
+                                vf.Width = parentVf.Width;
+                                vf.Height = parentVf.Height;
+                                _frameManager?.UpdateVisual(vf);
+                            }
+                        }
+                        catch { }
+                        return DynValue.Nil;
+                    }));
+
+                    // No-op ClearAllPoints to satisfy AceGUI release usage
+                    t.Set("ClearAllPoints", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+
+                    // No-op SetParent (some libraries call :SetParent)
+                    t.Set("SetParent", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+
+                    // Provide a simple userdata table getters used by AceGUI
+                    try
+                    {
+                        var ud = new Table(_script);
+                        t.Set("__userdata", DynValue.NewTable(ud));
+                        t.Set("GetUserDataTable", DynValue.NewCallback((c, a) => { var v = t.Get("__userdata"); return v ?? DynValue.NewTable(new Table(_script)); }));
+                        t.Set("GetUserData", DynValue.NewCallback((c, a) => { if (a.Count>=1 && a[0].Type==DataType.String) { var udv = t.Get("__userdata"); if (udv!=null && udv.Type==DataType.Table) { var val = udv.Table.Get(a[0]); return val ?? DynValue.Nil; } } return DynValue.Nil; }));
+                        t.Set("ReleaseChildren", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                    }
+                    catch { }
+
+                    // Provide a prototype/metatable fallback so frames created via different paths
+                    // still get the common UI helpers if a lookup misses on the instance table.
+                    try
+                    {
+                        var proto = new Table(_script);
+                        proto.Set("CreateFontString", createFontStringFn);
+                        proto.Set("SetNormalTexture", t.Get("SetNormalTexture") ?? DynValue.Nil);
+                        proto.Set("GetNormalTexture", t.Get("GetNormalTexture") ?? DynValue.Nil);
+                        proto.Set("SetPushedTexture", t.Get("SetPushedTexture") ?? DynValue.Nil);
+                        proto.Set("GetPushedTexture", t.Get("GetPushedTexture") ?? DynValue.Nil);
+                        proto.Set("SetHighlightTexture", t.Get("SetHighlightTexture") ?? DynValue.Nil);
+                        proto.Set("GetHighlightTexture", t.Get("GetHighlightTexture") ?? DynValue.Nil);
+                        proto.Set("UnregisterAllEvents", t.Get("UnregisterAllEvents") ?? DynValue.Nil);
+                        proto.Set("SetPropagateKeyboardInput", t.Get("SetPropagateKeyboardInput") ?? DynValue.Nil);
+
+                        var meta = new Table(_script);
+                        meta.Set("__index", DynValue.NewTable(proto));
+                        t.MetaTable = meta;
+                    }
+                    catch { }
+
+                    // Provide UnregisterAllEvents no-op to satisfy libraries that call it
+                    t.Set("UnregisterAllEvents", DynValue.NewCallback((c, a) =>
+                    {
+                        try
+                        {
+                            if (vf != null && vf.RegisteredEventWrappers != null)
+                            {
+                                foreach (var kv in vf.RegisteredEventWrappers)
+                                {
+                                    var ev = kv.Key;
+                                    var closure = kv.Value;
+                                    if (_eventHandlers.TryGetValue(ev, out var list)) list.RemoveAll(cw => cw == closure);
+                                }
+                                vf.RegisteredEventWrappers.Clear();
+                            }
+                        }
+                        catch { }
+                        return DynValue.Nil;
+                    }));
+
                 // Allow frames to register/unregister for events
                 t.Set("RegisterEvent", DynValue.NewCallback((c, a) =>
                 {
@@ -990,6 +1415,68 @@ namespace Flux
 
                 // Provide reference to the C# frame id (for debugging)
                 t.Set("__id", DynValue.NewString(vf?.Id ?? string.Empty));
+
+                // If the caller provided a name (CreateFrame(type, name, parent, template)),
+                // use it for a sensible default visual and WoW-like placement so addons
+                // that create canonical frames appear in expected locations.
+                try
+                {
+                    string? frameName = null;
+                    if (args != null && args.Count >= 2 && args[1].Type == DataType.String)
+                    {
+                        frameName = args[1].String;
+                    }
+
+                    if (!string.IsNullOrEmpty(frameName))
+                    {
+                        // expose name to Lua table and show as label in the visual
+                        t.Set("__name", DynValue.NewString(frameName));
+                        vf.Text = frameName;
+
+                        // Ensure a reasonable default size for common frames
+                        if (vf.Width <= 0) vf.Width = 120;
+                        if (vf.Height <= 0) vf.Height = 40;
+
+                        var canvasSize = _frameManager?.GetCanvasSize() ?? new Size(800, 600);
+
+                        // Basic WoW-like placements (top-left origin):
+                        // PlayerFrame: bottom-left, Minimap: top-right, PartyMemberFrameN: stacked left area, ChatFrame: bottom-left large
+                        if (frameName.Equals("PlayerFrame", StringComparison.OrdinalIgnoreCase))
+                        {
+                            vf.X = 20;
+                            vf.Y = canvasSize.Height - vf.Height - 20;
+                        }
+                        else if (frameName.IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            // round minimap visually handled in FrameManager by checking vf.Text == "Minimap"
+                            vf.Width = Math.Max(vf.Width, 100);
+                            vf.Height = Math.Max(vf.Height, 100);
+                            vf.X = canvasSize.Width - vf.Width - 20;
+                            vf.Y = 20;
+                        }
+                        else if (frameName.StartsWith("PartyMemberFrame", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Party members stack vertically to the right of player frame area
+                            var m = System.Text.RegularExpressions.Regex.Match(frameName, "\\d+");
+                            int idx = 1;
+                            if (m.Success) int.TryParse(m.Value, out idx);
+                            double baseX = 20 + 140; // to the right of a typical player frame
+                            double baseY = canvasSize.Height - vf.Height - 20 - (idx - 1) * (vf.Height + 8);
+                            vf.X = baseX;
+                            vf.Y = baseY;
+                        }
+                        else if (frameName.StartsWith("ChatFrame", StringComparison.OrdinalIgnoreCase))
+                        {
+                            vf.Width = Math.Max(vf.Width, 340);
+                            vf.Height = Math.Max(vf.Height, 160);
+                            vf.X = 20;
+                            vf.Y = canvasSize.Height - vf.Height - 20 - 60; // leave room for player frame
+                        }
+
+                        _frameManager?.UpdateVisual(vf);
+                    }
+                }
+                catch { }
 
                 // Diagnostic: list methods on the returned table for easier debugging
                 try
@@ -1225,7 +1712,8 @@ namespace Flux
                 var minorsTbl = new Table(_script);
                 libStub.Set("libs", DynValue.NewTable(libsTbl));
                 libStub.Set("minors", DynValue.NewTable(minorsTbl));
-                libStub.Set("minor", DynValue.NewNumber(0));
+                // Present a compatible minor version so embedded LibStub files do not override our implementation
+                libStub.Set("minor", DynValue.NewNumber(2));
 
                 // __call metamethod: LibStub("Name") -> returns library table or nil
                 var mt = new Table(_script);
@@ -1249,10 +1737,95 @@ namespace Flux
                     if (!string.IsNullOrEmpty(name))
                     {
                         var dv = libsTbl.Get(name);
-                        if (dv != null && dv.Type == DataType.Table) return DynValue.NewTable(dv.Table);
+                        if (dv != null && dv.Type == DataType.Table)
+                        {
+                            try
+                            {
+                                var maybeNew = dv.Table.Get("NewAddon");
+                                EmitOutput($"[LuaRunner-Diag] LibStub.__call returning existing libsTbl['{name}'] NewAddonType={(maybeNew==null?"(null)":maybeNew.Type.ToString())}");
+                                // Ensure AceAddon exposes NewAddon even if overwritten by library code
+                                if ((maybeNew == null || maybeNew.Type == DataType.Nil) && string.Equals(name, "AceAddon-3.0", StringComparison.OrdinalIgnoreCase) && _preregisteredAceAddonNewAddon != null && _preregisteredAceAddonNewAddon.Type != DataType.Nil)
+                                {
+                                    dv.Table.Set("NewAddon", _preregisteredAceAddonNewAddon);
+                                    EmitOutput($"[LuaRunner-Diag] Injected preserved NewAddon into libsTbl['{name}']");
+                                }
+                                // Wrap the NewAddon entry with a stable CLR callback so method-call syntax always works.
+                                try
+                                {
+                                    var finalNew = dv.Table.Get("NewAddon");
+                                    if (finalNew != null && finalNew.Type != DataType.Nil)
+                                    {
+                                        var captured = finalNew; // capture the original implementation
+                                        dv.Table.Set("NewAddon", DynValue.NewCallback((ctx2, args2) =>
+                                        {
+                                            try
+                                            {
+                                                var callArgs = new List<DynValue>();
+                                                for (int i = 0; i < args2.Count; i++) callArgs.Add(args2[i]);
+                                                if (captured.Type == DataType.Function)
+                                                {
+                                                    return _script.Call(captured.Function, callArgs.ToArray());
+                                                }
+                                                // For ClrFunction and other callables, just call via script.Call
+                                                return _script.Call(captured, callArgs.ToArray());
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                try { EmitOutput("[LuaRunner-Diag] NewAddon wrapper exception: " + ex.Message); } catch { }
+                                            }
+                                            return DynValue.Nil;
+                                        }));
+                                        EmitOutput($"[LuaRunner-Diag] Wrapped NewAddon on libsTbl['{name}'] to ensure callable method semantics");
+                                    }
+                                }
+                                catch { }
+                            }
+                            catch { }
+                            return DynValue.NewTable(dv.Table);
+                        }
                         // fallback: if not in libsTbl, check our internal registry populated earlier
                         if (_libRegistry.TryGetValue(name, out var regTbl) && regTbl != null)
                         {
+                            try
+                            {
+                                var maybeNew = regTbl.Get("NewAddon");
+                                EmitOutput($"[LuaRunner-Diag] LibStub.__call returning _libRegistry['{name}'] NewAddonType={(maybeNew==null?"(null)":maybeNew.Type.ToString())}");
+                                if ((maybeNew == null || maybeNew.Type == DataType.Nil) && string.Equals(name, "AceAddon-3.0", StringComparison.OrdinalIgnoreCase) && _preregisteredAceAddonNewAddon != null && _preregisteredAceAddonNewAddon.Type != DataType.Nil)
+                                {
+                                    regTbl.Set("NewAddon", _preregisteredAceAddonNewAddon);
+                                    EmitOutput($"[LuaRunner-Diag] Injected preserved NewAddon into _libRegistry['{name}']");
+                                }
+                                // Wrap the NewAddon entry in the registry table as well so callers using :NewAddon will succeed.
+                                try
+                                {
+                                    var finalNew = regTbl.Get("NewAddon");
+                                    if (finalNew != null && finalNew.Type != DataType.Nil)
+                                    {
+                                        var captured = finalNew;
+                                        regTbl.Set("NewAddon", DynValue.NewCallback((ctx2, args2) =>
+                                        {
+                                            try
+                                            {
+                                                var callArgs = new List<DynValue>();
+                                                for (int i = 0; i < args2.Count; i++) callArgs.Add(args2[i]);
+                                                if (captured.Type == DataType.Function)
+                                                {
+                                                    return _script.Call(captured.Function, callArgs.ToArray());
+                                                }
+                                                return _script.Call(captured, callArgs.ToArray());
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                try { EmitOutput("[LuaRunner-Diag] NewAddon(wrapper) exception: " + ex.Message); } catch { }
+                                            }
+                                            return DynValue.Nil;
+                                        }));
+                                        EmitOutput($"[LuaRunner-Diag] Wrapped NewAddon on _libRegistry['{name}'] to ensure callable method semantics");
+                                    }
+                                }
+                                catch { }
+                            }
+                            catch { }
                             return DynValue.NewTable(regTbl);
                         }
                     }
@@ -1347,7 +1920,20 @@ namespace Flux
                             if (mdv != null && mdv.Type == DataType.Number) return DynValue.NewTuple(DynValue.NewTable(dv.Table), mdv);
                             return DynValue.NewTable(dv.Table);
                         }
-                        if (!silent) throw new ScriptRuntimeException($"Cannot find a library instance of {name}.");
+                        // Instead of throwing a hard error when a library isn't found,
+                        // create a minimal placeholder table so dependent libraries can
+                        // continue initialization without failing outright.
+                        if (!silent)
+                        {
+                            var placeholder = new Table(_script);
+                            placeholder.Set("__name", DynValue.NewString(name));
+                            placeholder.Set("__minor", DynValue.NewNumber(0));
+                            libsTbl.Set(name, DynValue.NewTable(placeholder));
+                            minorsTbl.Set(name, DynValue.NewNumber(0));
+                            try { _libRegistry[name] = placeholder; } catch { }
+                            EmitOutput($"[LuaRunner-Diag] LibStub.GetLibrary created placeholder for missing lib '{name}'");
+                            return DynValue.NewTable(placeholder);
+                        }
                     }
                     return DynValue.Nil;
                 }));
@@ -1383,9 +1969,11 @@ namespace Flux
                 catch { }
 
                 // Pre-register a minimal AceAddon-3.0 implementation
-                try
-                {
-                    var ace = new Table(_script);
+                    try
+                    {
+                        var ace = new Table(_script);
+                        // Ensure LibStub.libs contains our AceAddon table so LibStub('AceAddon-3.0') returns it
+                        try { libsTbl.Set("AceAddon-3.0", DynValue.NewTable(ace)); } catch { }
                     ace.Set("NewAddon", DynValue.NewCallback((ctx, args) =>
                     {
                         // Args: name [, ...mixins]
@@ -1498,6 +2086,37 @@ namespace Flux
                         return DynValue.Nil;
                     }));
 
+                        // preserve a reference to this NewAddon closure so we can inject it later
+                        try
+                        {
+                            var maybeNew = ace.Get("NewAddon");
+                            if (maybeNew != null && maybeNew.Type != DataType.Nil) _preregisteredAceAddonNewAddon = maybeNew;
+                        }
+                        catch { }
+
+                        // Provide a minimal CallbackHandler implementation globally so libraries
+                        // calling `CallbackHandler:New(...)` don't nil-call during initialization.
+                        try
+                        {
+                            var cbh = new Table(_script);
+                            cbh.Set("New", DynValue.NewCallback((ctx, args) =>
+                            {
+                                // Return a simple handler object with Register/Unregister/Fire
+                                var handler = new Table(_script);
+                                handler.Set("_callbacks", DynValue.NewTable(new Table(_script)));
+                                handler.Set("Register", DynValue.NewCallback((c2, a2) => { return DynValue.Nil; }));
+                                handler.Set("Unregister", DynValue.NewCallback((c2, a2) => { return DynValue.Nil; }));
+                                handler.Set("UnregisterAll", DynValue.NewCallback((c2, a2) => { return DynValue.Nil; }));
+                                handler.Set("Fire", DynValue.NewCallback((c2, a2) => { return DynValue.Nil; }));
+                                return DynValue.NewTable(handler);
+                            }));
+                            _script.Globals["CallbackHandler"] = DynValue.NewTable(cbh);
+                            // also register into LibStub.libs for callers that query it
+                            try { if (_libRegistry != null) _libRegistry["CallbackHandler-1.0"] = cbh; } catch { }
+                            try { libsTbl.Set("CallbackHandler-1.0", DynValue.NewTable(cbh)); } catch { }
+                        }
+                        catch { }
+
                     // Also register AceEvent-3.0 as a no-op library so mixins resolve
                     var aceEvent = new Table(_script);
                     // AceEvent: RegisterEvent(object, eventName, handler) and UnregisterEvent(object, eventName)
@@ -1568,6 +2187,7 @@ namespace Flux
                     }));
 
                     _libRegistry["AceEvent-3.0"] = aceEvent;
+                    try { libsTbl.Set("AceEvent-3.0", DynValue.NewTable(aceEvent)); } catch { }
 
                     // AceTimer: ScheduleTimer(object, funcOrName, delaySeconds) -> timerId; CancelTimer(object, timerId)
                     var aceTimer = new Table(_script);
@@ -1636,7 +2256,7 @@ namespace Flux
                                 try { timer.Dispose(); } catch { }
                             }
                         };
-
+                        // Mirror into C# registry so LibStub calls from other contexts can find it
                         lock (_aceTimers)
                         {
                             _aceTimers[addonName][id] = timer;
@@ -1665,6 +2285,7 @@ namespace Flux
                     }));
 
                     _libRegistry["AceTimer-3.0"] = aceTimer;
+                    try { libsTbl.Set("AceTimer-3.0", DynValue.NewTable(aceTimer)); } catch { }
                     // expose the AceAddon library object
                     _libRegistry["AceAddon-3.0"] = ace;
                     // Pre-register common library names so LibStub:GetLibrary won't return nil
@@ -1673,16 +2294,30 @@ namespace Flux
                         var commonLibs = new[] {
                             "CallbackHandler-1.0", "LibDataBroker-1.1", "LibDBIcon-1.0",
                             "HereBeDragons-2.0", "HereBeDragons-Pins-2.0", "AceGUI-3.0",
-                            "AceConsole-3.0", "AceDB-3.0", "LibStub"
+                            "AceConsole-3.0", "AceDB-3.0", "LibStub",
+                            // Ensure core Ace libraries are present in libsTbl early so LibStub("Name") returns them
+                            "AceAddon-3.0", "AceLocale-3.0", "AceEvent-3.0", "AceTimer-3.0"
                         };
                         foreach (var cname in commonLibs)
                         {
                             if (!_libRegistry.ContainsKey(cname)) _libRegistry[cname] = new Table(_script);
                         }
+                        // Also populate the LibStub libs table so LibStub("Name") returns the table directly
+                        try
+                        {
+                            foreach (var cname in commonLibs)
+                            {
+                                if (_libRegistry.TryGetValue(cname, out var tbl) && tbl != null)
+                                {
+                                    try { libsTbl.Set(cname, DynValue.NewTable(tbl)); } catch { }
+                                }
+                            }
+                        }
+                        catch { }
                     }
                     catch { }
 
-                    // Provide a minimal AceLocale implementation: GetLocale(addonName) -> table
+                        // Provide a minimal AceLocale implementation: GetLocale(addonName) -> table
                     try
                     {
                         var aceLocale = new Table(_script);
@@ -1704,6 +2339,10 @@ namespace Flux
                             return DynValue.NewTable(locTbl);
                         }));
                         _libRegistry["AceLocale-3.0"] = aceLocale;
+                        // Ensure LibStub.libs returns this concrete table (replace any placeholder)
+                        try { libsTbl.Set("AceLocale-3.0", DynValue.NewTable(aceLocale)); EmitOutput("[LuaRunner-Diag] Registered AceLocale-3.0 into LibStub.libs"); } catch { }
+                        // Also expose as a global for older code paths
+                        try { _script.Globals["AceLocale-3.0"] = DynValue.NewTable(aceLocale); } catch { }
                     }
                     catch { }
 
@@ -1769,6 +2408,7 @@ namespace Flux
                             return DynValue.Nil;
                         }));
                         _libRegistry["LibDataBroker-1.1"] = ldb;
+                        try { libsTbl.Set("LibDataBroker-1.1", DynValue.NewTable(ldb)); } catch { }
                     }
                     catch { }
 
@@ -1780,6 +2420,7 @@ namespace Flux
                         dbicon.Set("Show", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
                         dbicon.Set("Hide", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
                         _libRegistry["LibDBIcon-1.0"] = dbicon;
+                        try { libsTbl.Set("LibDBIcon-1.0", DynValue.NewTable(dbicon)); } catch { }
                     }
                     catch { }
 
@@ -1894,6 +2535,22 @@ namespace Flux
                     var cf = _script.Globals.Get("CreateFrame");
                     var ls = _script.Globals.Get("LibStub");
                     EmitOutput($"[LuaRunner-Diag] About to execute chunk='{chunkName}' CreateFrameType={cf?.Type} LibStubType={ls?.Type}");
+                }
+                catch { }
+
+                // Extra diagnostics for Attune startup: inspect LibStub('AceAddon-3.0') and its NewAddon field
+                try
+                {
+                    if ((filePath != null && filePath.IndexOf("Attune\\Attune.lua", StringComparison.OrdinalIgnoreCase) >= 0) || string.Equals(addonName, "Attune", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            var dbgChunk = @"local a = LibStub('AceAddon-3.0'); if a==nil then print('[LuaRunner-Diag] Pre-Attune: LibStub returned nil for AceAddon') else print('[LuaRunner-Diag] Pre-Attune: LibStub AceAddon object type='..type(a)..' NewAddon type='..(a.NewAddon and type(a.NewAddon) or 'nil')) end
+local loc = LibStub('AceLocale-3.0'); if loc==nil then print('[LuaRunner-Diag] Pre-Attune: AceLocale returned nil') else print('[LuaRunner-Diag] Pre-Attune: AceLocale type='..type(loc)..' GetLocale type='..(loc.GetLocale and type(loc.GetLocale) or 'nil')); if type(loc.GetLocale)=='function' then local L = loc:GetLocale('Attune'); print('[LuaRunner-Diag] Pre-Attune: AceLocale:GetLocale returned type='..type(L)) else print('[LuaRunner-Diag] Pre-Attune: AceLocale:GetLocale missing') end end";
+                            _script.DoString(dbgChunk);
+                        }
+                        catch { }
+                    }
                 }
                 catch { }
 
@@ -2061,6 +2718,12 @@ namespace Flux
                 {
                     try
                     {
+                        if (h == null)
+                        {
+                            EmitOutput($"[LuaRunner] TriggerEvent {eventName} skipping null handler");
+                            continue;
+                        }
+                        try { EmitOutput($"[LuaRunner] TriggerEvent invoking handler for {eventName} (closure={h.GetHashCode()})"); } catch { }
                         _script.Call(h, dynArgs.ToArray());
                     }
                     catch (Exception ex)

@@ -28,6 +28,9 @@
       <Button Name="OpenSampleButton" Content="Run Sample Addon" Margin="0,6,0,0"/>
 
       <Separator Margin="0,12,0,6"/>
+      <TextBlock Text="Workspace Explorer" FontWeight="Bold" Margin="0,12,0,0"/>
+      <ListBox Name="WorkspaceList" Margin="0,6,0,0" Height="240"/>
+      <Button Name="RefreshWorkspaceButton" Content="Refresh Explorer" Margin="0,6,0,0"/>
       <TextBlock Text="Event Simulator" FontWeight="Bold"/>
       <ComboBox Name="EventCombo" Margin="0,6,0,0" SelectedIndex="0">
         <ComboBoxItem>PLAYER_LOGIN</ComboBoxItem>

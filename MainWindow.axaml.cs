@@ -56,6 +56,15 @@ namespace Flux
             if (openBtn != null) openBtn.Click += OpenButton_Click;
             var settingsBtn = this.FindControl<Button>("SettingsButton");
             if (settingsBtn != null) settingsBtn.Click += SettingsButton_Click;
+
+            // Workspace tree handlers
+            var list = this.FindControl<ListBox>("WorkspaceList");
+            if (list != null)
+            {
+                list.DoubleTapped += WorkspaceList_DoubleTapped;
+            }
+            var refreshBtn = this.FindControl<Button>("RefreshWorkspaceButton");
+            if (refreshBtn != null) refreshBtn.Click += RefreshWorkspaceButton_Click;
         }
 
         private void LoadLogo()
@@ -75,7 +84,7 @@ namespace Flux
             catch { }
         }
 
-        private void AppendToConsole(string text)
+        public void AppendToConsole(string text)
         {
             var tb = this.FindControl<TextBox>("ConsoleTextBox");
             if (tb == null) return;
@@ -109,6 +118,7 @@ namespace Flux
             {
                 _addonManager?.TriggerEvent("PLAYER_LOGIN");
                 _addonManager?.SaveSavedVariables(runner.AddonName);
+                PopulateWorkspaceTree(runner);
             }
         }
 
@@ -212,6 +222,15 @@ namespace Flux
             UpdateInspector();
         }
 
+        private void WorkspaceList_DoubleTapped(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+        {
+            var list = this.FindControl<ListBox>("WorkspaceList");
+            if (list == null) return;
+            var sel = list.SelectedItem as string;
+            if (string.IsNullOrEmpty(sel)) return;
+            if (File.Exists(sel)) OpenFileInEditor(sel);
+        }
+
         private void UpdateInspector()
         {
             var idBox = this.FindControl<TextBox>("InspectorId");
@@ -279,6 +298,86 @@ namespace Flux
             tryAdd(a3);
 
             return list.ToArray();
+        }
+
+        private void RefreshWorkspaceButton_Click(object? sender, RoutedEventArgs e)
+        {
+            // Refresh currently selected addon in tree if any
+            var list = this.FindControl<ListBox>("WorkspaceList");
+            if (list == null) return;
+            var selected = list.SelectedItem as string;
+            if (string.IsNullOrEmpty(selected)) return;
+            // If a file selected, use its parent folder; otherwise use selected as folder
+            var folder = selected;
+            if (File.Exists(selected)) folder = Path.GetDirectoryName(selected) ?? selected;
+            if (Directory.Exists(folder))
+            {
+                var runner = _addonManager?.LoadAddonFromFolder(folder, LuaRunner_OnOutput);
+                if (runner != null) PopulateWorkspaceTree(runner);
+            }
+        }
+
+        private void WorkspaceTree_DoubleTapped(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+        {
+            var list = this.FindControl<ListBox>("WorkspaceList");
+            if (list == null) return;
+            var sel = list.SelectedItem as string;
+            if (string.IsNullOrEmpty(sel)) return;
+            if (File.Exists(sel)) OpenFileInEditor(sel);
+        }
+
+        private void PopulateWorkspaceTree(LuaRunner runner)
+        {
+            if (runner == null) return;
+            var list = this.FindControl<ListBox>("WorkspaceList");
+            if (list == null) return;
+            Dispatcher.UIThread.Post(() =>
+            {
+                try
+                {
+                    var folder = runner.AddonFolder;
+                    if (!string.IsNullOrEmpty(folder) && Directory.Exists(folder))
+                    {
+                        var files = Directory.GetFiles(folder, "*.lua", SearchOption.AllDirectories);
+                        // show full paths as items
+                        list.ItemsSource = files;
+                    }
+                    else
+                    {
+                        list.ItemsSource = Array.Empty<string>();
+                    }
+                }
+                catch { list.ItemsSource = Array.Empty<string>(); }
+            });
+        }
+
+        private void OpenFileInEditor(string filePath)
+        {
+            if (!File.Exists(filePath))
+            {
+                AppendToConsole($"[Editor] File not found: {filePath}");
+                return;
+            }
+            string content = string.Empty;
+            try { content = File.ReadAllText(filePath); } catch (Exception ex) { AppendToConsole($"[Editor] Read error: {ex.Message}"); }
+
+            var editor = new FileEditorWindow(filePath, content, (savedPath) =>
+            {
+                try
+                {
+                    // After saving, reload addon folder
+                    var folder = Path.GetDirectoryName(savedPath) ?? string.Empty;
+                    if (!string.IsNullOrEmpty(folder) && Directory.Exists(folder))
+                    {
+                        var runner = _addonManager?.LoadAddonFromFolder(folder, LuaRunner_OnOutput);
+                        if (runner != null) PopulateWorkspaceTree(runner);
+                        _addonManager?.TriggerEvent("PLAYER_LOGIN");
+                    }
+                }
+                catch (Exception ex) { AppendToConsole($"[Editor] Reload error: {ex.Message}"); }
+            });
+
+            editor.Show(this);
         }
 
         private string FormatArgs(object?[] args)
@@ -379,7 +478,8 @@ namespace Flux
                                         var pAllow = ptype.GetProperty("AllowMultiple") ?? ptype.GetProperty("AllowMultipleSelection") ?? ptype.GetProperty("AllowMultipleDirectories");
                                         if (pAllow != null && pAllow.CanWrite && (pAllow.PropertyType == typeof(bool) || pAllow.PropertyType == typeof(bool?)))
                                         {
-                                            pAllow.SetValue(options, false);
+                                            // Allow multiple folder selection when provider supports it
+                                            pAllow.SetValue(options, true);
                                         }
                                     }
                                     catch { }
@@ -418,6 +518,7 @@ namespace Flux
                                 var enumRes = result as System.Collections.IEnumerable;
                                 if (enumRes != null)
                                 {
+                                    var anyLoaded = false;
                                     foreach (var item in enumRes)
                                     {
                                         string? path = null;
@@ -500,9 +601,12 @@ namespace Flux
                                                 AppendToConsole($"[Toolbar] Could not load addon from selection: {path}");
                                             }
                                             handled = true;
-                                            break;
+                                            anyLoaded = anyLoaded || loaded;
+                                            // continue processing remaining selected items
+                                            continue;
                                         }
                                     }
+                                    if (anyLoaded) handled = true;
                                 }
                             }
                         }
@@ -538,7 +642,15 @@ namespace Flux
 
         private void SettingsButton_Click(object? sender, RoutedEventArgs e)
         {
-            AppendToConsole("[Toolbar] Settings clicked — (not implemented)");
+            try
+            {
+                var win = new LogViewerWindow();
+                win.Show(this);
+            }
+            catch (Exception ex)
+            {
+                AppendToConsole("[Toolbar] Failed to open logs: " + ex.Message);
+            }
         }
 
         private async Task<bool> TryLoadAddonPathAsync(string inputPath)
@@ -559,6 +671,7 @@ namespace Flux
                     AppendToConsole($"[Toolbar] Loaded addon: {runner.AddonName}");
                     _addonManager?.TriggerEvent("PLAYER_LOGIN");
                     _addonManager?.SaveSavedVariables(runner.AddonName);
+                    PopulateWorkspaceTree(runner);
                     return true;
                 }
             }
@@ -600,6 +713,7 @@ namespace Flux
                             AppendToConsole($"[Toolbar] Loaded addon: {runner.AddonName}");
                             _addonManager?.TriggerEvent("PLAYER_LOGIN");
                             _addonManager?.SaveSavedVariables(runner.AddonName);
+                                PopulateWorkspaceTree(runner);
                             return true;
                         }
                     }

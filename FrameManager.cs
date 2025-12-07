@@ -36,6 +36,14 @@ namespace Flux
 
         // When using nine-patch, these are the 9 child images (TL, T, TR, L, C, R, BL, B, BR)
         public Avalonia.Controls.Image[]? NineRects { get; set; }
+        // Small overlay bar (e.g., health/power) shown at bottom of many unit frames
+        public Rectangle? HealthBar { get; set; }
+        // 0.0..1.0
+        public double HealthPercent { get; set; } = 1.0;
+        // Optional portrait image shown on the left of unit frames
+        public Avalonia.Controls.Image? Portrait { get; set; }
+        // Optional class name to influence color styling
+        public string? ClassName { get; set; }
         public LuaRunner Owner { get; }
 
         // Map of eventName -> wrapper closure stored when RegisterEvent is called
@@ -59,6 +67,18 @@ namespace Flux
                 Text = string.Empty,
                 Foreground = Brushes.Black,
                 FontSize = FontSize
+            };
+            HealthBar = new Rectangle
+            {
+                Fill = Brushes.Green,
+                Height = 6,
+                StrokeThickness = 0,
+                IsVisible = false
+            };
+            Portrait = new Avalonia.Controls.Image
+            {
+                Stretch = Avalonia.Media.Stretch.UniformToFill,
+                IsVisible = false
             };
             NineRects = null;
         }
@@ -117,13 +137,29 @@ namespace Flux
                     var hit = HitTest(p);
                     if (hit != _hoveredFrame)
                     {
+                        // revert previous hovered visuals
                         if (_hoveredFrame != null)
                         {
+                            try
+                            {
+                                _hoveredFrame.Visual.Fill = Avalonia.Media.Brushes.LightGray;
+                                _hoveredFrame.Visual.Stroke = Avalonia.Media.Brushes.DarkGray;
+                                if (_hoveredFrame.VisualText != null) _hoveredFrame.VisualText.Text = _hoveredFrame.Text ?? string.Empty;
+                            }
+                            catch { }
                             try { if (_hoveredFrame.OnLeave != null) _hoveredFrame.Owner.InvokeClosure(_hoveredFrame.OnLeave); } catch { }
                         }
                         _hoveredFrame = hit;
                         if (hit != null)
                         {
+                            try
+                            {
+                                // apply visible hover styling
+                                hit.Visual.Fill = Avalonia.Media.Brushes.LightSteelBlue;
+                                hit.Visual.Stroke = Avalonia.Media.Brushes.DodgerBlue;
+                                if (hit.VisualText != null) hit.VisualText.Text = (hit.Text ?? string.Empty) + " (hover)";
+                            }
+                            catch { }
                             try { if (hit.OnEnter != null) hit.Owner.InvokeClosure(hit.OnEnter); } catch { }
                         }
                     }
@@ -155,8 +191,12 @@ namespace Flux
             Dispatcher.UIThread.Post(() =>
             {
                 _canvas.Children.Add(vf.Visual);
+                if (vf.Portrait != null)
+                    _canvas.Children.Add(vf.Portrait);
                 if (vf.VisualText != null)
                     _canvas.Children.Add(vf.VisualText);
+                if (vf.HealthBar != null)
+                    _canvas.Children.Add(vf.HealthBar);
                 UpdateVisual(vf);
 
                 // Note: pointer events are handled at the canvas level for hit-testing
@@ -177,10 +217,26 @@ namespace Flux
                 Canvas.SetTop(vf.Visual, vf.Y);
                 vf.Visual.IsVisible = vf.Visible;
                 vf.Visual.Opacity = vf.Opacity;
+                // Apply nicer default styling when no backdrop is present
+                if (!vf.UseNinePatch && vf.BackdropBitmap == null && vf.BackdropBrush == null)
+                {
+                    // different presets for common frames
+                    LinearGradientBrush grd = new LinearGradientBrush();
+                    grd.StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative);
+                    grd.EndPoint = new RelativePoint(0, 1, RelativeUnit.Relative);
+                    var top = new GradientStop(Colors.DimGray, 0.0);
+                    var bottom = new GradientStop(Colors.Gray, 1.0);
+                    grd.GradientStops.Add(top);
+                    grd.GradientStops.Add(bottom);
+                    vf.Visual.Fill = grd;
+                    vf.Visual.StrokeThickness = 1;
+                    vf.Visual.Stroke = Brushes.Black;
+                }
                 // If using nine-patch bitmap rendering, create/update 9 child rects
                 if (vf.UseNinePatch && vf.BackdropBitmap != null && vf.NinePatchInsets.HasValue)
                 {
-                    Console.WriteLine($"[FrameManager] UpdateVisual for frame {vf.Id}: UseNinePatch={vf.UseNinePatch} Bitmap={(vf.BackdropBitmap != null ? vf.BackdropBitmap.PixelSize.ToString() : "null")} Insets={vf.NinePatchInsets}");
+                    var bmpLocal = vf.BackdropBitmap!;
+                    Console.WriteLine($"[FrameManager] UpdateVisual for frame {vf.Id}: UseNinePatch={vf.UseNinePatch} Bitmap={(bmpLocal != null ? bmpLocal.PixelSize.ToString() : "null")} Insets={vf.NinePatchInsets}");
                     // remove main visual fill so the nine rects show
                     vf.Visual.Fill = Brushes.Transparent;
 
@@ -198,7 +254,7 @@ namespace Flux
                     }
 
                     // compute slices in pixels based on bitmap size
-                    var bmp = vf.BackdropBitmap;
+                    var bmp = vf.BackdropBitmap!;
                     int bmpW = bmp.PixelSize.Width;
                     int bmpH = bmp.PixelSize.Height;
                     var insets = vf.NinePatchInsets.Value;
@@ -318,9 +374,55 @@ namespace Flux
                 {
                     vf.VisualText.Text = vf.Text ?? string.Empty;
                     vf.VisualText.FontSize = vf.FontSize;
-                    Canvas.SetLeft(vf.VisualText, vf.X + 4);
+                    vf.VisualText.Foreground = Brushes.White;
+                    double textOffsetX = (vf.Portrait != null && vf.Portrait.IsVisible) ? 38 : 6;
+                    Canvas.SetLeft(vf.VisualText, vf.X + textOffsetX);
                     Canvas.SetTop(vf.VisualText, vf.Y + 4);
                     vf.VisualText.IsVisible = vf.Visible && !string.IsNullOrEmpty(vf.VisualText.Text);
+                    // If this is a minimap, show as a circular rounded rect
+                    if (!string.IsNullOrEmpty(vf.Text) && vf.Text.Equals("Minimap", StringComparison.OrdinalIgnoreCase))
+                    {
+                        vf.Visual.RadiusX = vf.Width / 2.0;
+                        vf.Visual.RadiusY = vf.Height / 2.0;
+                    }
+
+                    // Update health bar overlay if present
+                    if (vf.HealthBar != null)
+                    {
+                        // show health bar for unit-like frames (heuristic)
+                        bool showBar = !string.IsNullOrEmpty(vf.Text) && (vf.Text.Equals("Player", StringComparison.OrdinalIgnoreCase) || vf.Text.Equals("Pet", StringComparison.OrdinalIgnoreCase) || vf.Text.StartsWith("Party"));
+                        vf.HealthBar.IsVisible = vf.Visible && showBar && vf.Width > 40;
+                        if (vf.HealthBar.IsVisible)
+                        {
+                            double barW = Math.Max(8, vf.Width - 8);
+                            double filled = Math.Max(0.0, Math.Min(1.0, vf.HealthPercent));
+                            vf.HealthBar.Width = barW * filled;
+                            Canvas.SetLeft(vf.HealthBar, vf.X + 4 + ((vf.Portrait != null && vf.Portrait.IsVisible) ? 32 : 0));
+                            Canvas.SetTop(vf.HealthBar, vf.Y + vf.Height - vf.HealthBar.Height - 4);
+                            vf.HealthBar.Height = Math.Max(4, vf.HealthBar.Height);
+                            // color from green->red
+                            var g = (byte)(Math.Min(255, (int)(filled * 255)));
+                            var r = (byte)(255 - g);
+                            vf.HealthBar.Fill = new SolidColorBrush(Color.FromRgb(r, g, 32));
+                        }
+                    }
+                    // Update portrait position/size
+                    if (vf.Portrait != null)
+                    {
+                        if (vf.Portrait.IsVisible)
+                        {
+                            double psize = Math.Min(32, Math.Min(vf.Width - 8, vf.Height - 8));
+                            Canvas.SetLeft(vf.Portrait, vf.X + 4);
+                            Canvas.SetTop(vf.Portrait, vf.Y + 4);
+                            vf.Portrait.Width = psize;
+                            vf.Portrait.Height = psize;
+                            vf.Portrait.IsVisible = vf.Visible;
+                        }
+                        else
+                        {
+                            vf.Portrait.IsVisible = false;
+                        }
+                    }
                 }
             });
         }
