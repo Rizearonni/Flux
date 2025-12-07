@@ -14,4 +14,7 @@ f:SetSize(200,80)
 f:SetPoint("CENTER", "UIParent", "CENTER", -100, -50) -- anchor form
 f:Show()
 f:SetScript("OnClick", function() print("Clicked!") end)
+f:SetScript("OnUpdate", function(self, dt) print(string.format("OnUpdate dt=%.3f", dt or 0.0)) end)
+f:SetScript("OnEnter", function() print("OnEnter") end)
+f:SetScript("OnLeave", function() print("OnLeave") end)
 print("Flux sample addon: initialization complete")

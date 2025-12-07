@@ -318,16 +318,94 @@ namespace Flux
                 bool handled = false;
                 if (storageProvider != null)
                 {
-                    var mi = storageProvider.GetType().GetMethod("OpenFolderPickerAsync", BindingFlags.Public | BindingFlags.Instance) ??
-                             storageProvider.GetType().GetMethod("OpenFolderPickerAsync");
-                    if (mi != null)
+                    // Find all overloads named OpenFolderPickerAsync and pick the best one.
+                    var methods = storageProvider.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance);
+                    MethodInfo? chosen = null;
+                    foreach (var m in methods)
                     {
-                        var parameters = mi.GetParameters();
+                        if (m.Name != "OpenFolderPickerAsync") continue;
+                        var ps = m.GetParameters();
+                        // Prefer zero-arg overload
+                        if (ps.Length == 0)
+                        {
+                            chosen = m; break;
+                        }
+                        // Otherwise prefer overloads taking an options object we can create
+                        if (ps.Length == 1)
+                        {
+                            var ptype = ps[0].ParameterType;
+                            // Skip if parameter expects TopLevel (we won't pass 'this')
+                            if (ptype.Name.Contains("FolderPicker") || ptype.Name.Contains("Options") )
+                            {
+                                chosen = m; break;
+                            }
+                        }
+                    }
+
+                    if (chosen != null)
+                    {
                         object? taskObj = null;
+                        var parameters = chosen.GetParameters();
                         if (parameters.Length == 0)
-                            taskObj = mi.Invoke(storageProvider, Array.Empty<object>());
-                        else
-                            taskObj = mi.Invoke(storageProvider, new object[] { this });
+                        {
+                            taskObj = chosen.Invoke(storageProvider, Array.Empty<object>());
+                        }
+                        else if (parameters.Length == 1)
+                        {
+                            var ptype = parameters[0].ParameterType;
+                            object? options = null;
+                            try
+                            {
+                                // Try to create an instance of the options type (if it has a parameterless ctor)
+                                options = Activator.CreateInstance(ptype);
+
+                                if (options != null)
+                                {
+                                    // Populate common option properties if present: InitialDirectory / Directory and allow/multiselect
+                                    try
+                                    {
+                                        var initial = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "sample_addons"));
+                                        var pi = ptype.GetProperty("InitialDirectory") ?? ptype.GetProperty("InitialFolder") ?? ptype.GetProperty("Directory") ?? ptype.GetProperty("StartLocation");
+                                        if (pi != null && pi.CanWrite && pi.PropertyType == typeof(string))
+                                        {
+                                            pi.SetValue(options, initial);
+                                        }
+                                    }
+                                    catch { }
+
+                                    try
+                                    {
+                                        var pAllow = ptype.GetProperty("AllowMultiple") ?? ptype.GetProperty("AllowMultipleSelection") ?? ptype.GetProperty("AllowMultipleDirectories");
+                                        if (pAllow != null && pAllow.CanWrite && (pAllow.PropertyType == typeof(bool) || pAllow.PropertyType == typeof(bool?)))
+                                        {
+                                            pAllow.SetValue(options, false);
+                                        }
+                                    }
+                                    catch { }
+
+                                    try
+                                    {
+                                        var pTitle = ptype.GetProperty("Title") ?? ptype.GetProperty("Label");
+                                        if (pTitle != null && pTitle.CanWrite && pTitle.PropertyType == typeof(string))
+                                        {
+                                            pTitle.SetValue(options, "Select addon folder");
+                                        }
+                                    }
+                                    catch { }
+                                }
+                            }
+                            catch { options = null; }
+
+                            // If we couldn't create options or invocation fails, try passing null (some implementations accept null)
+                            try
+                            {
+                                taskObj = chosen.Invoke(storageProvider, new object[] { options });
+                            }
+                            catch (TargetInvocationException)
+                            {
+                                try { taskObj = chosen.Invoke(storageProvider, new object[] { null }); } catch { taskObj = null; }
+                            }
+                        }
 
                         if (taskObj is Task task)
                         {

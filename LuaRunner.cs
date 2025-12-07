@@ -16,6 +16,16 @@ namespace Flux
 
         public event EventHandler<string>? OnOutput;
 
+        private void EmitOutput(string s)
+        {
+            try
+            {
+                OnOutput?.Invoke(this, s);
+            }
+            catch { }
+            try { Console.WriteLine(s); } catch { }
+        }
+
         private FrameManager? _frameManager;
 
         public LuaRunner(string addonName, FrameManager? frameManager = null)
@@ -42,11 +52,11 @@ namespace Flux
                         sb.Append(args[i].ToPrintString());
                     }
 
-                    OnOutput?.Invoke(this, sb.ToString());
+                    EmitOutput(sb.ToString());
                 }
                 catch (Exception ex)
                 {
-                    OnOutput?.Invoke(this, "[print-error] " + ex.Message);
+                    EmitOutput("[print-error] " + ex.Message);
                 }
 
                 return DynValue.Nil;
@@ -64,7 +74,7 @@ namespace Flux
                     {
                         if (!_eventHandlers.ContainsKey(ev)) _eventHandlers[ev] = new List<Closure>();
                         _eventHandlers[ev].Add(cb.Function);
-                        OnOutput?.Invoke(this, $"[WoW] Registered event handler for {ev}");
+                        EmitOutput($"[WoW] Registered event handler for {ev}");
                     }
                 }
                 return DynValue.Nil;
@@ -253,15 +263,15 @@ namespace Flux
             {
                 // Execute the code directly in the script's environment
                 _script.DoString(code);
-                OnOutput?.Invoke(this, $"[Lua] Script {addonName} executed.");
+                EmitOutput($"[Lua] Script {addonName} executed.");
             }
             catch (ScriptRuntimeException ex)
             {
-                OnOutput?.Invoke(this, "[Lua runtime error] " + ex.DecoratedMessage);
+                EmitOutput("[Lua runtime error] " + ex.DecoratedMessage);
             }
             catch (Exception ex)
             {
-                OnOutput?.Invoke(this, "[Lua error] " + ex.Message);
+                EmitOutput("[Lua error] " + ex.Message);
             }
         }
 
@@ -284,7 +294,7 @@ namespace Flux
             }
             catch (Exception ex)
             {
-                OnOutput?.Invoke(this, "[Closure error] " + ex.Message);
+                EmitOutput("[Closure error] " + ex.Message);
             }
         }
 
@@ -312,7 +322,7 @@ namespace Flux
                     }
                     catch (Exception ex)
                     {
-                        OnOutput?.Invoke(this, "[Event handler error] " + ex.Message);
+                        EmitOutput("[Event handler error] " + ex.Message);
                     }
                 }
             }
