@@ -26,7 +26,9 @@ if f ~= nil then
   -- Place slightly left/above center for visibility
   f:SetPoint("CENTER", "UIParent", "CENTER", -100, -50)
   -- Visual helpers added to the runtime: SetBackdrop and SetFontSize
-  f:SetBackdrop("LightGreen")
+  -- Example: use a nine-patch texture called "textures/frame9.png" with 8px insets.
+  -- The path is resolved relative to the addon folder when run by Flux.
+  f:SetBackdrop({ texture = "textures/frame9.png", ninepatch = { left = 8, right = 8, top = 8, bottom = 8 }, tile = false })
   f:SetFontSize(16)
   f:Show()
 

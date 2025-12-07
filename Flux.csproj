@@ -15,5 +15,12 @@
     <PackageReference Include="Avalonia.ReactiveUI" Version="11.0.0" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.0.0" />
   </ItemGroup>
+  <!-- Exclude test projects from the default compile set when tests live under the repo folder -->
+  <ItemGroup>
+    <Compile Remove="tests\**\*.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Remove="tools\**\*.cs" />
+  </ItemGroup>
   <!-- Project uses default compile items; no explicit removals needed. -->
 </Project>

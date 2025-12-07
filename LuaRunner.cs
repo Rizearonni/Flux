@@ -224,42 +224,113 @@ namespace Flux
 
                 t.Set("SetBackdrop", DynValue.NewCallback((c, a) =>
                 {
-                    // Accept a color name string (e.g., "Red", "LightGray") or hex color (#RRGGBB) and apply a Brush
+                    // Accept a color name string (e.g., "Red", "LightGray"), hex color (#RRGGBB),
+                    // or a table: { texture = "path", ninepatch = {left=..., right=..., top=..., bottom=...}, tile = true }
                     if (vf == null) return DynValue.Nil;
-                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    try
                     {
-                        var colorName = a[0].String;
-                        try
+                        if (a.Count >= 1)
                         {
-                            // Hex color #RRGGBB or #AARRGGBB
-                            if (!string.IsNullOrEmpty(colorName) && colorName.StartsWith("#"))
+                            // Support both call styles: f:SetBackdrop(tbl) (self, tbl) and f.SetBackdrop(tbl) (tbl)
+                            DynValue payload = a[0];
+                            if (a.Count >= 2) payload = a[1];
+
+                            if (payload.Type == DataType.String)
                             {
-                                try
+                                var colorName = payload.String;
+                                // Hex color #RRGGBB or #AARRGGBB
+                                if (!string.IsNullOrEmpty(colorName) && colorName.StartsWith("#"))
                                 {
-                                    var col = Avalonia.Media.Color.Parse(colorName);
-                                    vf.BackdropBrush = new SolidColorBrush(col);
-                                    _frameManager?.UpdateVisual(vf);
-                                }
-                                catch { }
-                            }
-                            else
-                            {
-                                // Try to find a Brushes.<Name> property
-                                var brushesType = typeof(Avalonia.Media.Brushes);
-                                var prop = brushesType.GetProperty(colorName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.IgnoreCase);
-                                if (prop != null)
-                                {
-                                    var brush = prop.GetValue(null) as Avalonia.Media.IBrush;
-                                    if (brush != null)
+                                    try
                                     {
-                                        vf.BackdropBrush = brush;
+                                        var col = Avalonia.Media.Color.Parse(colorName);
+                                        vf.BackdropBrush = new SolidColorBrush(col);
+                                        vf.UseNinePatch = false;
                                         _frameManager?.UpdateVisual(vf);
+                                    }
+                                    catch { }
+                                }
+                                else
+                                {
+                                    var brushesType = typeof(Avalonia.Media.Brushes);
+                                    var prop = brushesType.GetProperty(colorName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.IgnoreCase);
+                                    if (prop != null)
+                                    {
+                                        var brush = prop.GetValue(null) as Avalonia.Media.IBrush;
+                                        if (brush != null)
+                                        {
+                                            vf.BackdropBrush = brush;
+                                            vf.UseNinePatch = false;
+                                            _frameManager?.UpdateVisual(vf);
+                                        }
                                     }
                                 }
                             }
+                            else if (payload.Type == DataType.Table)
+                            {
+                                // parse options
+                                var table = payload.Table;
+                                string? texturePath = null;
+                                (int left, int right, int top, int bottom)? insets = null;
+                                bool tile = false;
+
+                                var tex = table.Get("texture");
+                                if (tex != null && tex.Type == DataType.String) texturePath = tex.String;
+                                var np = table.Get("ninepatch");
+                                if (np != null && np.Type == DataType.Table)
+                                {
+                                    var nt = np.Table;
+                                    int left = (int)(nt.Get("left")?.Number ?? 0);
+                                    int right = (int)(nt.Get("right")?.Number ?? 0);
+                                    int top = (int)(nt.Get("top")?.Number ?? 0);
+                                    int bottom = (int)(nt.Get("bottom")?.Number ?? 0);
+                                    insets = (left, right, top, bottom);
+                                }
+                                var ti = table.Get("tile");
+                                if (ti != null && ti.Type == DataType.Boolean) tile = ti.Boolean;
+
+                                if (!string.IsNullOrEmpty(texturePath))
+                                {
+                                    try
+                                    {
+                                        string resolved = texturePath;
+                                        if (!System.IO.Path.IsPathRooted(texturePath) && !string.IsNullOrEmpty(_addonFolder))
+                                        {
+                                            resolved = System.IO.Path.GetFullPath(System.IO.Path.Combine(_addonFolder, texturePath));
+                                        }
+                                        EmitOutput($"[LuaRunner] SetBackdrop requested texture='{texturePath}' resolved='{resolved}'");
+                                        if (System.IO.File.Exists(resolved))
+                                        {
+                                            EmitOutput($"[LuaRunner] Texture file found: {resolved}");
+                                            var bmp = new Avalonia.Media.Imaging.Bitmap(resolved);
+                                            vf.BackdropBitmap = bmp;
+                                            vf.TileBackdrop = tile;
+                                            if (insets.HasValue)
+                                            {
+                                                vf.NinePatchInsets = insets;
+                                                vf.UseNinePatch = true;
+                                                EmitOutput($"[LuaRunner] Enabled nine-patch with insets={insets.Value}");
+                                            }
+                                            else
+                                            {
+                                                vf.UseNinePatch = false;
+                                                // set as ImageBrush
+                                                vf.BackdropBrush = new ImageBrush(bmp) { Stretch = Avalonia.Media.Stretch.Fill };
+                                                EmitOutput($"[LuaRunner] Applied image brush from: {resolved}");
+                                            }
+                                            _frameManager?.UpdateVisual(vf);
+                                        }
+                                        else
+                                        {
+                                            EmitOutput($"[LuaRunner] Texture file not found: {resolved}");
+                                        }
+                                    }
+                                    catch { }
+                                }
+                            }
                         }
-                        catch { }
                     }
+                    catch { }
                     return DynValue.Nil;
                 }));
 
