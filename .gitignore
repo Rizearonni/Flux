@@ -1,0 +1,57 @@
+# Build outputs
+/bin/
+/obj/
+/out/
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Rider caches
+.idea/
+*.iml
+
+# Visual Studio Code
+.vscode/
+
+# NuGet
+*.nupkg
+packages/
+project.lock.json
+
+# ASP.NET temp files
+App_Data/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# Generated native binaries
+*.dll
+*.exe
+
+# Dotnet user and publish files
+*.dbmdl
+*.cache
+*.dotCover
+*.dotCover.*
+*.pidb
+*.pdb
+*.mdb
+*.svclog
+
+# Secrets (do not track)
+secrets.json
+.env
+*.pem
+*.key
