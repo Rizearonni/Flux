@@ -15,6 +15,7 @@ namespace Flux
     {
         private readonly Dictionary<string, Table> _addonNamespaces = new();
         private Script _script;
+        private FrameManager? _frameManager;
         private readonly Dictionary<string, Table> _libRegistry = new();
         private readonly Dictionary<string, Dictionary<string, Closure>> _aceRegisteredHandlers = new();
         private readonly Dictionary<string, Table> _aceAddons = new();
@@ -37,20 +38,247 @@ namespace Flux
             catch { }
             try { Console.WriteLine(s); } catch { }
         }
-
-        private FrameManager? _frameManager;
-
         private readonly string? _addonFolder;
-
-        public LuaRunner(string addonName, FrameManager? frameManager = null, string? addonFolder = null)
+        public bool IsClassic { get; private set; }
+        public int InterfaceVersion { get; private set; }
+        public LuaRunner(string addonName, FrameManager? frameManager = null, string? addonFolder = null, int interfaceVersion = 0, bool isClassic = false)
         {
             _frameManager = frameManager;
             AddonName = addonName;
             _addonFolder = addonFolder;
+            IsClassic = isClassic;
+            InterfaceVersion = interfaceVersion;
 
             // Create script with common core modules so libraries have standard Lua functions
             // Enable Basic, Table, String, Math and Coroutine modules (safe subset)
             _script = new Script(CoreModules.Basic | CoreModules.Table | CoreModules.String | CoreModules.Math | CoreModules.Coroutine);
+
+            // Expose common string function aliases used by many addons (strmatch, strfind, strsub, format)
+            try
+            {
+                var strMod = _script.Globals.Get("string");
+                if (strMod != null && strMod.Type == DataType.Table)
+                {
+                    var st = strMod.Table;
+                    var maybe = st.Get("match"); if (maybe != null) _script.Globals["strmatch"] = maybe;
+                    maybe = st.Get("find"); if (maybe != null) _script.Globals["strfind"] = maybe;
+                    maybe = st.Get("sub"); if (maybe != null) _script.Globals["strsub"] = maybe;
+                    maybe = st.Get("upper"); if (maybe != null) _script.Globals["strupper"] = maybe;
+                    maybe = st.Get("lower"); if (maybe != null) _script.Globals["strlower"] = maybe;
+                    maybe = st.Get("format"); if (maybe != null) _script.Globals["format"] = maybe;
+                }
+            }
+            catch { }
+
+            // Robust strmatch: coerce first arg to string if needed, handle common pattern "%d+" via Regex,
+            // otherwise fall back to string.match if available.
+            try
+            {
+                _script.Globals["strmatch"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 2)
+                    {
+                        var subjectDv = args[0];
+                        var patDv = args[1];
+                        string subject = subjectDv.Type == DataType.String ? subjectDv.String : subjectDv.ToPrintString();
+                        string pat = patDv.Type == DataType.String ? patDv.String ?? string.Empty : patDv.ToPrintString();
+                        try
+                        {
+                            if (pat == "%d+")
+                            {
+                                var m = System.Text.RegularExpressions.Regex.Match(subject ?? string.Empty, "\\d+");
+                                if (m.Success) return DynValue.NewString(m.Value);
+                                return DynValue.Nil;
+                            }
+                            // fallback to string.match if present
+                            var strTbl = _script.Globals.Get("string");
+                            if (strTbl != null && strTbl.Type == DataType.Table)
+                            {
+                                var matchFn = strTbl.Table.Get("match");
+                                if (matchFn != null && matchFn.Type == DataType.Function)
+                                {
+                                    return _script.Call(matchFn.Function, DynValue.NewString(subject), DynValue.NewString(pat));
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                    return DynValue.Nil;
+                });
+            }
+            catch { }
+
+            // securecallfunction shim - run functions safely similar to WoW's secure call
+            try
+            {
+                _script.Globals["securecallfunction"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 1)
+                    {
+                        var fn = args[0];
+                        try
+                        {
+                            if (fn.Type == DataType.Function) // Lua function
+                            {
+                                var callArgs = new List<DynValue>();
+                                for (int i = 1; i < args.Count; i++) callArgs.Add(args[i]);
+                                _script.Call(fn.Function, callArgs.ToArray());
+                            }
+                            else if (fn.Type == DataType.ClrFunction)
+                            {
+                                var callArgs = new List<DynValue>();
+                                for (int i = 1; i < args.Count; i++) callArgs.Add(args[i]);
+                                _script.Call(fn);
+                            }
+                        }
+                        catch { }
+                    }
+                    return DynValue.Nil;
+                });
+
+                // alias
+                _script.Globals["securecall"] = _script.Globals["securecallfunction"];
+            }
+            catch { }
+
+            // Convenience globals/shims for compatibility with many WoW libraries
+            try { _script.Globals["_G"] = _script.Globals; } catch { }
+
+            try
+            {
+                _script.Globals["select"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count == 0) return DynValue.Nil;
+                    if (args[0].Type == DataType.Number)
+                    {
+                        int start = (int)args[0].Number;
+                        var list = new List<DynValue>();
+                        for (int i = start; i < args.Count; i++) list.Add(args[i]);
+                        return DynValue.NewTuple(list.ToArray());
+                    }
+                    if (args[0].Type == DataType.String && args[0].String == "#")
+                    {
+                        return DynValue.NewNumber(args.Count - 1);
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["unpack"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 1 && args[0].Type == DataType.Table)
+                    {
+                        var tbl = args[0].Table;
+                        var list = new List<DynValue>();
+                        foreach (var p in tbl.Values) list.Add(p);
+                        return DynValue.NewTuple(list.ToArray());
+                    }
+                    return DynValue.Nil;
+                });
+            }
+            catch { }
+
+            try { _script.Globals["GetLocale"] = DynValue.NewCallback((c, a) => DynValue.NewString("enUS")); } catch { }
+            try { _script.Globals["GetAddOnMetadata"] = DynValue.NewCallback((c, a) => DynValue.NewString(string.Empty)); } catch { }
+            try { _script.Globals["GetAddOnInfo"] = DynValue.NewCallback((c, a) => DynValue.NewTuple(DynValue.NewString(""), DynValue.NewBoolean(false))); } catch { }
+            try { _script.Globals["UnitName"] = DynValue.NewCallback((c, a) => DynValue.NewString("Player")); } catch { }
+            // table helpers commonly expected by WoW addons
+            try
+            {
+                _script.Globals["tinsert"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 2 && args[0].Type == DataType.Table)
+                    {
+                        var tbl = args[0].Table;
+                        DynValue val = args[1];
+                        // find max numeric index
+                        int max = 0;
+                        foreach (var p in tbl.Pairs)
+                        {
+                            if (p.Key.Type == DataType.Number)
+                            {
+                                int k = (int)p.Key.Number;
+                                if (k > max) max = k;
+                            }
+                        }
+                        tbl.Set(DynValue.NewNumber(max + 1), val);
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["tremove"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 1 && args[0].Type == DataType.Table)
+                    {
+                        var tbl = args[0].Table;
+                        int max = 0;
+                        foreach (var p in tbl.Pairs)
+                        {
+                            if (p.Key.Type == DataType.Number)
+                            {
+                                int k = (int)p.Key.Number;
+                                if (k > max) max = k;
+                            }
+                        }
+                        int idx = max;
+                        if (args.Count >= 2 && args[1].Type == DataType.Number) idx = (int)args[1].Number;
+                        var key = DynValue.NewNumber(idx);
+                        var val = tbl.Get(idx);
+                        tbl.Set(key, DynValue.Nil);
+                        return val ?? DynValue.Nil;
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["wipe"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 1 && args[0].Type == DataType.Table)
+                    {
+                        var tbl = args[0].Table;
+                        var keys = new List<DynValue>();
+                        foreach (var p in tbl.Pairs) keys.Add(p.Key);
+                        foreach (var k in keys) tbl.Set(k, DynValue.Nil);
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["tContains"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 2 && args[0].Type == DataType.Table)
+                    {
+                        var tbl = args[0].Table;
+                        var search = args[1];
+                        foreach (var p in tbl.Pairs)
+                        {
+                            if (p.Value.Equals(search)) return DynValue.NewBoolean(true);
+                        }
+                    }
+                    return DynValue.NewBoolean(false);
+                });
+            }
+            catch { }
+
+            // Improve GetAddOnMetadata to return sensible defaults for Title/Version
+            try
+            {
+                _script.Globals["GetAddOnMetadata"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 2 && args[0].Type == DataType.String && args[1].Type == DataType.String)
+                    {
+                        var requestedAddon = args[0].String;
+                        var key = args[1].String;
+                        // If caller requests metadata for our current addon or passes empty name, return values
+                        if (string.IsNullOrEmpty(requestedAddon) || string.Equals(requestedAddon, AddonName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (string.Equals(key, "Title", StringComparison.OrdinalIgnoreCase) || string.Equals(key, "Name", StringComparison.OrdinalIgnoreCase))
+                                return DynValue.NewString(AddonName);
+                            if (string.Equals(key, "Version", StringComparison.OrdinalIgnoreCase) || string.Equals(key, "X-MinVersion", StringComparison.OrdinalIgnoreCase))
+                                return DynValue.NewString("1.0");
+                        }
+                    }
+                    return DynValue.NewString(string.Empty);
+                });
+            }
+            catch { }
 
             // Create saved variables table with metatable to detect writes
             InitializeSavedVariablesTable(null);
@@ -451,6 +679,183 @@ namespace Flux
                 _script.Globals["UIParent"] = DynValue.NewTable(uiParent);
             }
             catch { }
+
+            // Expose basic build info and project constants to emulate Classic/Retail differences
+            try
+            {
+                var build = IsClassic ? "Classic" : "Retail";
+                var buildString = IsClassic ? "1.0" : "1.0";
+                _script.Globals["GetBuildInfo"] = DynValue.NewCallback((c, a) => DynValue.NewTuple(DynValue.NewString(buildString), DynValue.NewString("build"), DynValue.NewNumber(InterfaceVersion)));
+            }
+            catch { }
+
+            try
+            {
+                // WOW_PROJECT constants
+                _script.Globals["WOW_PROJECT_MAINLINE"] = DynValue.NewNumber(1);
+                _script.Globals["WOW_PROJECT_CLASSIC"] = DynValue.NewNumber(2);
+                _script.Globals["WOW_PROJECT_ID"] = DynValue.NewNumber(IsClassic ? 2 : 1);
+            }
+            catch { }
+
+            // C_Timer minimal shim: After(callback, seconds)
+            try
+            {
+                var ctimer = new Table(_script);
+                ctimer.Set("After", DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 2 && (args[0].Type == DataType.Function || args[0].Type == DataType.ClrFunction) && args[1].Type == DataType.Number)
+                    {
+                        var func = args[0].Function;
+                        var delay = args[1].Number;
+                        var timer = new System.Timers.Timer(delay * 1000.0) { AutoReset = false };
+                        timer.Elapsed += (s, e) =>
+                        {
+                            try
+                            {
+                                timer.Stop();
+                                Dispatcher.UIThread.Post(() =>
+                                {
+                                    try { _script.Call(func); } catch { }
+                                });
+                            }
+                            catch { }
+                            finally { try { timer.Dispose(); } catch { } }
+                        };
+                        timer.Start();
+                    }
+                    return DynValue.Nil;
+                }));
+                _script.Globals["C_Timer"] = DynValue.NewTable(ctimer);
+            }
+            catch { }
+
+            // Provide table.* aliases (table.insert/remove/concat)
+            try
+            {
+                var tmod = new Table(_script);
+                tmod.Set("insert", DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 2 && a[0].Type == DataType.Table)
+                    {
+                        var tbl = a[0].Table;
+                        DynValue val = a[1];
+                        int max = 0;
+                        foreach (var p in tbl.Pairs) if (p.Key.Type == DataType.Number) max = Math.Max(max, (int)p.Key.Number);
+                        tbl.Set(DynValue.NewNumber(max + 1), val);
+                    }
+                    return DynValue.Nil;
+                }));
+                tmod.Set("remove", DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1 && a[0].Type == DataType.Table)
+                    {
+                        var tbl = a[0].Table;
+                        int idx = 0;
+                        if (a.Count >= 2 && a[1].Type == DataType.Number) idx = (int)a[1].Number;
+                        if (idx == 0)
+                        {
+                            int max = 0; foreach (var p in tbl.Pairs) if (p.Key.Type == DataType.Number) max = Math.Max(max, (int)p.Key.Number);
+                            idx = max;
+                        }
+                        var val = tbl.Get(idx);
+                        tbl.Set(DynValue.NewNumber(idx), DynValue.Nil);
+                        return val ?? DynValue.Nil;
+                    }
+                    return DynValue.Nil;
+                }));
+                tmod.Set("concat", DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1 && a[0].Type == DataType.Table)
+                    {
+                        var tbl = a[0].Table;
+                        var sb = new System.Text.StringBuilder();
+                        foreach (var p in tbl.Values) sb.Append(p.ToPrintString());
+                        return DynValue.NewString(sb.ToString());
+                    }
+                    return DynValue.NewString(string.Empty);
+                }));
+                _script.Globals["table"] = DynValue.NewTable(tmod);
+            }
+            catch { }
+
+            // Basic global stubs to emulate Vanilla/Classic environment
+            try
+            {
+                // DEFAULT_CHAT_FRAME:AddMessage
+                var chatFrame = new Table(_script);
+                chatFrame.Set("AddMessage", DynValue.NewCallback((c, a) =>
+                {
+                    try
+                    {
+                        if (a.Count >= 1) EmitOutput("[CHAT] " + a[0].ToPrintString());
+                    }
+                    catch { }
+                    return DynValue.Nil;
+                }));
+                _script.Globals["DEFAULT_CHAT_FRAME"] = DynValue.NewTable(chatFrame);
+
+                // Simple addon loaded registry
+                var loadedSet = new Table(_script);
+                _script.Globals["_LoadedAddOns"] = DynValue.NewTable(loadedSet);
+
+                _script.Globals["IsAddOnLoaded"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    {
+                        var name = a[0].String;
+                        // consider the current addon as loaded
+                        if (string.Equals(name, AddonName, StringComparison.OrdinalIgnoreCase)) return DynValue.NewBoolean(true);
+                        var v = loadedSet.Get(name);
+                        return DynValue.NewBoolean(v.Type != DataType.Nil);
+                    }
+                    return DynValue.NewBoolean(false);
+                });
+
+                _script.Globals["LoadAddOn"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    {
+                        var name = a[0].String;
+                        loadedSet.Set(name, DynValue.NewBoolean(true));
+                        EmitOutput($"[AddOn] LoadAddOn requested: {name}");
+                        return DynValue.NewBoolean(true);
+                    }
+                    return DynValue.NewBoolean(false);
+                });
+
+                // PlaySound / PlaySoundFile no-op (log)
+                _script.Globals["PlaySound"] = DynValue.NewCallback((c, a) => { try { if (a.Count>=1) EmitOutput("[Sound] " + a[0].ToPrintString()); } catch { } return DynValue.Nil; });
+                _script.Globals["PlaySoundFile"] = DynValue.NewCallback((c, a) => { try { if (a.Count>=1) EmitOutput("[SoundFile] " + a[0].ToPrintString()); } catch { } return DynValue.Nil; });
+
+                // Simple CVar storage
+                var cvarTable = new Table(_script);
+                _script.Globals["_CVars"] = DynValue.NewTable(cvarTable);
+                _script.Globals["GetCVar"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    {
+                        var key = a[0].String;
+                        var v = cvarTable.Get(key);
+                        if (v.Type == DataType.String) return v;
+                        if (v.Type == DataType.Number) return v;
+                        return DynValue.NewString(string.Empty);
+                    }
+                    return DynValue.NewString(string.Empty);
+                });
+                _script.Globals["SetCVar"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 2 && a[0].Type == DataType.String)
+                    {
+                        var key = a[0].String;
+                        var val = a[1];
+                        cvarTable.Set(key, val);
+                    }
+                    return DynValue.Nil;
+                });
+            }
+            catch { }
+
         }
 
         private void InitializeLibStub()
@@ -458,6 +863,12 @@ namespace Flux
             try
             {
                 var libStub = new Table(_script);
+                // Provide libs and minors tables as in real LibStub
+                var libsTbl = new Table(_script);
+                var minorsTbl = new Table(_script);
+                libStub.Set("libs", DynValue.NewTable(libsTbl));
+                libStub.Set("minors", DynValue.NewTable(minorsTbl));
+                libStub.Set("minor", DynValue.NewNumber(0));
 
                 // __call metamethod: LibStub("Name") -> returns library table or nil
                 var mt = new Table(_script);
@@ -466,7 +877,13 @@ namespace Flux
                     if (args.Count >= 1 && args[0].Type == DataType.String)
                     {
                         var name = args[0].String;
-                        if (_libRegistry.TryGetValue(name, out var t)) return DynValue.NewTable(t);
+                        var dv = libsTbl.Get(name);
+                        if (dv != null && dv.Type == DataType.Table) return DynValue.NewTable(dv.Table);
+                        // fallback: if not in libsTbl, check our internal registry populated earlier
+                        if (_libRegistry.TryGetValue(name, out var regTbl) && regTbl != null)
+                        {
+                            return DynValue.NewTable(regTbl);
+                        }
                     }
                     return DynValue.Nil;
                 }));
@@ -478,22 +895,29 @@ namespace Flux
                     {
                         var name = args[0].String;
                         int minor = 0;
-                        if (args.Count >= 2 && args[1].Type == DataType.Number) minor = (int)args[1].Number;
-
-                        if (_libRegistry.TryGetValue(name, out var existing))
+                        // accept number or string-like
+                        if (args.Count >= 2)
                         {
-                            // If existing minor is >= requested, do nothing
-                            var exMinorDyn = existing.Get("__minor");
-                            if (exMinorDyn != null && exMinorDyn.Type == DataType.Number && (int)exMinorDyn.Number >= minor)
+                            if (args[1].Type == DataType.Number) minor = (int)args[1].Number;
+                            else if (args[1].Type == DataType.String)
                             {
-                                return DynValue.Nil;
+                                var mstr = args[1].String ?? string.Empty;
+                                var mm = System.Text.RegularExpressions.Regex.Match(mstr, "\\d+");
+                                if (mm.Success) minor = int.Parse(mm.Value);
                             }
                         }
 
-                        var t = new Table(_script);
+                        var existingDv = libsTbl.Get(name);
+                        var existingMinorDv = minorsTbl.Get(name);
+                        int existingMinor = 0;
+                        if (existingMinorDv != null && existingMinorDv.Type == DataType.Number) existingMinor = (int)existingMinorDv.Number;
+                        if (existingMinor >= minor) return DynValue.Nil;
+
+                        var t = existingDv != null && existingDv.Type == DataType.Table ? existingDv.Table : new Table(_script);
                         t.Set("__name", DynValue.NewString(name));
                         t.Set("__minor", DynValue.NewNumber(minor));
-                        _libRegistry[name] = t;
+                        libsTbl.Set(name, DynValue.NewTable(t));
+                        minorsTbl.Set(name, DynValue.NewNumber(minor));
                         return DynValue.NewTable(t);
                     }
                     return DynValue.Nil;
@@ -505,13 +929,26 @@ namespace Flux
                     if (args.Count >= 1 && args[0].Type == DataType.String)
                     {
                         var name = args[0].String;
-                        if (_libRegistry.TryGetValue(name, out var t)) return DynValue.NewTable(t);
+                        var dv = libsTbl.Get(name);
+                        var mdv = minorsTbl.Get(name);
+                        if (dv != null && dv.Type == DataType.Table)
+                        {
+                            // return lib table and minor
+                            if (mdv != null && mdv.Type == DataType.Number) return DynValue.NewTuple(DynValue.NewTable(dv.Table), mdv);
+                            return DynValue.NewTable(dv.Table);
+                        }
+                        // if not found and silent -> nil
+                        bool silent = false;
+                        if (args.Count >= 2 && args[1].Type == DataType.Boolean) silent = args[1].Boolean;
+                        if (!silent) throw new ScriptRuntimeException($"Cannot find a library instance of {name}.");
                     }
                     return DynValue.Nil;
                 }));
 
                 libStub.MetaTable = mt;
                 _script.Globals["LibStub"] = DynValue.NewTable(libStub);
+                // also mirror into our _libRegistry for compatibility
+                _libRegistry["LibStub"] = libStub;
 
                 // Pre-register a minimal AceAddon-3.0 implementation
                 try
@@ -520,9 +957,19 @@ namespace Flux
                     ace.Set("NewAddon", DynValue.NewCallback((ctx, args) =>
                     {
                         // Args: name [, ...mixins]
+                        string? name = null;
+                        // support both NewAddon("Name", ...) and :NewAddon("Name", ...)
                         if (args.Count >= 1 && args[0].Type == DataType.String)
                         {
-                            var name = args[0].String;
+                            name = args[0].String;
+                        }
+                        else if (args.Count >= 2 && args[0].Type == DataType.Table && args[1].Type == DataType.String)
+                        {
+                            name = args[1].String;
+                        }
+
+                        if (!string.IsNullOrEmpty(name))
+                        {
                             var addonTbl = new Table(_script);
                             addonTbl.Set("__name", DynValue.NewString(name));
 
@@ -788,30 +1235,236 @@ namespace Flux
                     _libRegistry["AceTimer-3.0"] = aceTimer;
                     // expose the AceAddon library object
                     _libRegistry["AceAddon-3.0"] = ace;
+                    // Pre-register common library names so LibStub:GetLibrary won't return nil
+                    try
+                    {
+                        var commonLibs = new[] {
+                            "CallbackHandler-1.0", "LibDataBroker-1.1", "LibDBIcon-1.0",
+                            "HereBeDragons-2.0", "HereBeDragons-Pins-2.0", "AceGUI-3.0",
+                            "AceConsole-3.0", "AceDB-3.0", "LibStub"
+                        };
+                        foreach (var cname in commonLibs)
+                        {
+                            if (!_libRegistry.ContainsKey(cname)) _libRegistry[cname] = new Table(_script);
+                        }
+                    }
+                    catch { }
+
+                    // Provide a minimal AceLocale implementation: GetLocale(addonName) -> table
+                    try
+                    {
+                        var aceLocale = new Table(_script);
+                        aceLocale.Set("GetLocale", DynValue.NewCallback((ctx, args) =>
+                        {
+                            // return a table that returns the key string for any missing localization
+                            var locTbl = new Table(_script);
+                            var mtLoc = new Table(_script);
+                            mtLoc.Set("__index", DynValue.NewCallback((c2, a2) =>
+                            {
+                                if (a2.Count >= 2 && a2[2].Type == DataType.String)
+                                {
+                                    return DynValue.NewString(a2[2].String);
+                                }
+                                return DynValue.NewString(string.Empty);
+                            }));
+                            locTbl.MetaTable = mtLoc;
+                            return DynValue.NewTable(locTbl);
+                        }));
+                        _libRegistry["AceLocale-3.0"] = aceLocale;
+                    }
+                    catch { }
+
+                    // Minimal LibDataBroker implementation
+                    try
+                    {
+                        var ldb = new Table(_script);
+                        var objects = new Table(_script);
+                        ldb.Set("_objects", DynValue.NewTable(objects));
+                        ldb.Set("NewDataObject", DynValue.NewCallback((ctx, args) =>
+                        {
+                            if (args.Count >= 2 && args[0].Type == DataType.String && args[1].Type == DataType.Table)
+                            {
+                                var name = args[0].String;
+                                var obj = args[1].Table;
+                                // attach a simple callbacks table to the object
+                                var cbTbl = new Table(_script);
+                                var cbStore = new Dictionary<string, List<Closure>>();
+                                cbTbl.Set("Register", DynValue.NewCallback((c2, a2) =>
+                                {
+                                    if (a2.Count >= 2 && a2[0].Type == DataType.String && (a2[1].Type == DataType.Function || a2[1].Type == DataType.ClrFunction))
+                                    {
+                                        var ev = a2[0].String;
+                                        if (!cbStore.ContainsKey(ev)) cbStore[ev] = new List<Closure>();
+                                        cbStore[ev].Add(a2[1].Function);
+                                    }
+                                    return DynValue.Nil;
+                                }));
+                                cbTbl.Set("Unregister", DynValue.NewCallback((c2, a2) =>
+                                {
+                                    if (a2.Count >= 2 && a2[0].Type == DataType.String)
+                                    {
+                                        var ev = a2[0].String;
+                                        if (cbStore.ContainsKey(ev) && a2.Count >= 2)
+                                        {
+                                            // remove matching function if provided
+                                            // (simple remove all for now)
+                                            cbStore.Remove(ev);
+                                        }
+                                    }
+                                    return DynValue.Nil;
+                                }));
+                                cbTbl.Set("Fire", DynValue.NewCallback((c2, a2) =>
+                                {
+                                    if (a2.Count >= 1 && a2[0].Type == DataType.String)
+                                    {
+                                        var ev = a2[0].String;
+                                        if (cbStore.TryGetValue(ev, out var list))
+                                        {
+                                            foreach (var fn in list)
+                                            {
+                                                try { _script.Call(fn); } catch { }
+                                            }
+                                        }
+                                    }
+                                    return DynValue.Nil;
+                                }));
+
+                                obj.Set("callbacks", DynValue.NewTable(cbTbl));
+                                objects.Set(name, DynValue.NewTable(obj));
+                                return DynValue.NewTable(obj);
+                            }
+                            return DynValue.Nil;
+                        }));
+                        _libRegistry["LibDataBroker-1.1"] = ldb;
+                    }
+                    catch { }
+
+                    // Minimal LibDBIcon implementation (no-op show/hide/register)
+                    try
+                    {
+                        var dbicon = new Table(_script);
+                        dbicon.Set("Register", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                        dbicon.Set("Show", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                        dbicon.Set("Hide", DynValue.NewCallback((c, a) => { return DynValue.Nil; }));
+                        _libRegistry["LibDBIcon-1.0"] = dbicon;
+                    }
+                    catch { }
+
+                        // Minimal CallbackHandler-1.0 shim: provides New(name) -> handler with Register/Unregister/Fire
+                        try
+                        {
+                            var cbh = new Table(_script);
+                            cbh.Set("New", DynValue.NewCallback((ctx, args) =>
+                            {
+                                var handlerTbl = new Table(_script);
+                                // internal storage for callbacks: table of lists
+                                var cbStorage = new Table(_script);
+                                handlerTbl.Set("__callbacks", DynValue.NewTable(cbStorage));
+
+                                handlerTbl.Set("RegisterCallback", DynValue.NewCallback((c2, a2) =>
+                                {
+                                    if (a2.Count >= 2 && a2[0].Type == DataType.String && (a2[1].Type == DataType.Function || a2[1].Type == DataType.ClrFunction))
+                                    {
+                                        var evName = a2[0].String;
+                                        var listDv = cbStorage.Get(evName);
+                                        Table listTbl;
+                                        if (listDv.Type == DataType.Table) listTbl = listDv.Table;
+                                        else { listTbl = new Table(_script); cbStorage.Set(evName, DynValue.NewTable(listTbl)); }
+                                        // append
+                                        int max = 0; foreach (var p in listTbl.Pairs) if (p.Key.Type == DataType.Number) max = Math.Max(max, (int)p.Key.Number);
+                                        listTbl.Set(DynValue.NewNumber(max + 1), a2[1]);
+                                    }
+                                    return DynValue.Nil;
+                                }));
+
+                                // Aliases commonly used by libraries
+                                handlerTbl.Set("Register", handlerTbl.Get("RegisterCallback"));
+
+                                handlerTbl.Set("UnregisterCallback", DynValue.NewCallback((c2, a2) =>
+                                {
+                                    if (a2.Count >= 2 && a2[0].Type == DataType.String)
+                                    {
+                                        var evName = a2[0].String;
+                                        var cb = a2.Count >= 2 ? a2[1] : null;
+                                        var listDv = cbStorage.Get(evName);
+                                        if (listDv.Type == DataType.Table && cb != null)
+                                        {
+                                            var listTbl = listDv.Table;
+                                            var keys = new List<DynValue>();
+                                            foreach (var p in listTbl.Pairs) if (!p.Value.Equals(cb)) keys.Add(p.Key);
+                                            foreach (var k in keys) listTbl.Set(k, DynValue.Nil);
+                                        }
+                                    }
+                                    return DynValue.Nil;
+                                }));
+
+                                handlerTbl.Set("Unregister", handlerTbl.Get("UnregisterCallback"));
+
+                                handlerTbl.Set("Fire", DynValue.NewCallback((c2, a2) =>
+                                {
+                                    if (a2.Count >= 1 && a2[0].Type == DataType.String)
+                                    {
+                                        var evName = a2[0].String;
+                                        var listDv = cbStorage.Get(evName);
+                                        if (listDv.Type == DataType.Table)
+                                        {
+                                            var listTbl = listDv.Table;
+                                            foreach (var p in listTbl.Pairs)
+                                            {
+                                                var fn = p.Value;
+                                                try
+                                                {
+                                                    if (fn.Type == DataType.Function) _script.Call(fn.Function);
+                                                    else if (fn.Type == DataType.ClrFunction) _script.Call(fn);
+                                                }
+                                                catch { }
+                                            }
+                                        }
+                                    }
+                                    return DynValue.Nil;
+                                }));
+
+                                return DynValue.NewTable(handlerTbl);
+                            }));
+
+                            _libRegistry["CallbackHandler-1.0"] = cbh;
+                            // also place into globals so older code can call CallbackHandler:New
+                            _script.Globals["CallbackHandler"] = DynValue.NewTable(cbh);
+                        }
+                        catch { }
                 }
                 catch { }
             }
             catch { }
         }
 
-        public void RunScriptFromString(string code, string addonName, string? firstVarArg = null)
+        public void RunScriptFromString(string code, string addonName, string? firstVarArg = null, bool isLibraryFile = false, double libraryMinor = 0, string? filePath = null)
         {
             try
             {
-                // Load the chunk and call it with (addonName, namespaceTable) like WoW does (local name, ns = ...)
-                var func = _script.LoadString(code);
+            // Load the chunk and call it with (addonName, namespaceTable) like WoW does (local name, ns = ...)
+            // Provide a chunk name (filePath) so runtime errors include the source filename/line numbers
+            var chunkName = filePath ?? (isLibraryFile ? $"@{addonName}:{firstVarArg ?? "lib"}" : $"@{addonName}:chunk");
+            var func = _script.LoadString(code, null, chunkName);
                 Table ns;
                 if (!_addonNamespaces.TryGetValue(addonName, out ns))
                 {
                     ns = new Table(_script);
                     _addonNamespaces[addonName] = ns;
                 }
-
-                // Determine first vararg to pass: library files may need their own MAJOR name
+                // Determine first vararg to pass: for library files, pass (MAJOR, MINOR).
                 var firstArg = firstVarArg ?? addonName;
 
-                // Call the loaded chunk with (firstArg, namespaceTable)
-                _script.Call(func, DynValue.NewString(firstArg), DynValue.NewTable(ns));
+                if (isLibraryFile)
+                {
+                    // Libraries expect (MAJOR, MINOR)
+                    _script.Call(func, DynValue.NewString(firstArg), DynValue.NewNumber(libraryMinor));
+                }
+                else
+                {
+                    // Addon files expect (addonName, namespaceTable)
+                    _script.Call(func, DynValue.NewString(addonName), DynValue.NewTable(ns));
+                }
                 EmitOutput($"[Lua] Script {addonName} executed.");
             }
             catch (ScriptRuntimeException ex)
@@ -821,6 +1474,88 @@ namespace Flux
             catch (Exception ex)
             {
                 EmitOutput("[Lua error] " + ex.Message);
+            }
+        }
+
+        // Load all .lua files under a directory as library files (useful for preloading Ace3 libs)
+        public void LoadLibrariesFromDirectory(string dirPath)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(dirPath) || !System.IO.Directory.Exists(dirPath)) return;
+                var files = System.IO.Directory.GetFiles(dirPath, "*.lua", System.IO.SearchOption.AllDirectories);
+                foreach (var f in files.OrderBy(p => p))
+                {
+                    try
+                    {
+                        // Skip certain files which overwrite our C# shims or depend heavily on WoW UI
+                        var fname = System.IO.Path.GetFileName(f);
+                        var skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            "LibStub.lua",
+                            "Ace3.lua",
+                            "ChatThrottleLib.lua",
+                            "AceGUIContainer-Window.lua",
+                            "AceGUIWidget-DropDown.lua",
+                            "AceGUIWidget-DropDown-Items.lua",
+                        };
+                        if (skip.Contains(fname))
+                        {
+                            EmitOutput($"[LuaRunner] Skipping preload of {fname}");
+                            continue;
+                        }
+                        var code = System.IO.File.ReadAllText(f);
+                        var libName = System.IO.Path.GetFileNameWithoutExtension(f);
+                        // Use the file's relative path as chunk name for better diagnostics
+                        var chunkRel = f;
+                        RunScriptFromString(code, libName, libName, isLibraryFile: true, libraryMinor: 0, filePath: chunkRel);
+                        EmitOutput($"[LuaRunner] Preloaded library: {libName} from {f}");
+                    }
+                    catch (Exception ex)
+                    {
+                        EmitOutput($"[LuaRunner] Failed to preload lib {f}: {ex.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                EmitOutput($"[LuaRunner] LoadLibrariesFromDirectory error: {ex.Message}");
+            }
+        }
+
+        // Load only libraries whose folder name matches the whitelist (top-level dir names under dirPath)
+        public void LoadLibrariesFromDirectory(string dirPath, IEnumerable<string> whitelist)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(dirPath) || !System.IO.Directory.Exists(dirPath)) return;
+                var allowed = new HashSet<string>(whitelist.Select(s => s.ToLowerInvariant()));
+                var topDirs = System.IO.Directory.GetDirectories(dirPath);
+                foreach (var td in topDirs)
+                {
+                    var name = System.IO.Path.GetFileName(td)?.ToLowerInvariant() ?? string.Empty;
+                    if (!allowed.Contains(name)) continue;
+                    var files = System.IO.Directory.GetFiles(td, "*.lua", System.IO.SearchOption.AllDirectories);
+                    foreach (var f in files.OrderBy(p => p))
+                    {
+                        try
+                        {
+                            var code = System.IO.File.ReadAllText(f);
+                            var libName = System.IO.Path.GetFileNameWithoutExtension(f);
+                            var chunkRel = f;
+                            RunScriptFromString(code, libName, libName, isLibraryFile: true, libraryMinor: 0, filePath: chunkRel);
+                            EmitOutput($"[LuaRunner] Preloaded library: {libName} from {f}");
+                        }
+                        catch (Exception ex)
+                        {
+                            EmitOutput($"[LuaRunner] Failed to preload lib {f}: {ex.Message}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                EmitOutput($"[LuaRunner] LoadLibrariesFromDirectory error: {ex.Message}");
             }
         }
 
@@ -1021,6 +1756,132 @@ namespace Flux
             proxy.MetaTable = mt;
 
             _script.Globals["SavedVariables"] = DynValue.NewTable(proxy);
+        }
+
+        private void InitializeVanillaApiStubs()
+        {
+            try
+            {
+                // Unit-related stubs
+                _script.Globals["UnitExists"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    {
+                        var u = a[0].String;
+                        if (string.IsNullOrEmpty(u)) return DynValue.NewBoolean(false);
+                        // consider common units present
+                        if (u == "player" || u == "target" || u.StartsWith("party") || u.StartsWith("raid")) return DynValue.NewBoolean(true);
+                    }
+                    return DynValue.NewBoolean(false);
+                });
+
+                _script.Globals["UnitIsDeadOrGhost"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(false));
+                _script.Globals["UnitLevel"] = DynValue.NewCallback((c, a) => DynValue.NewNumber(60));
+                _script.Globals["UnitHealth"] = DynValue.NewCallback((c, a) => DynValue.NewNumber(100));
+                _script.Globals["UnitHealthMax"] = DynValue.NewCallback((c, a) => DynValue.NewNumber(100));
+
+                _script.Globals["UnitClass"] = DynValue.NewCallback((c, a) =>
+                {
+                    // return className, classFile, classID
+                    return DynValue.NewTuple(DynValue.NewString("Warrior"), DynValue.NewString("WARRIOR"), DynValue.NewNumber(1));
+                });
+
+                // Group/raid stubs
+                _script.Globals["IsInGroup"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(false));
+                _script.Globals["IsInRaid"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(false));
+                _script.Globals["GetNumGroupMembers"] = DynValue.NewCallback((c, a) => DynValue.NewNumber(0));
+                _script.Globals["GetNumSubgroupMembers"] = DynValue.NewCallback((c, a) => DynValue.NewNumber(0));
+
+                // Map/zone stubs
+                _script.Globals["GetZoneText"] = DynValue.NewCallback((c, a) => DynValue.NewString("Unknown"));
+                _script.Globals["GetRealZoneText"] = _script.Globals["GetZoneText"];
+                _script.Globals["GetCurrentMapAreaID"] = DynValue.NewCallback((c, a) => DynValue.NewNumber(0));
+                _script.Globals["GetPlayerMapPosition"] = DynValue.NewCallback((c, a) => DynValue.NewTuple(DynValue.NewNumber(0.0), DynValue.NewNumber(0.0)));
+
+                // Spell/item info stubs (best-effort)
+                _script.Globals["GetSpellInfo"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1)
+                    {
+                        if (a[0].Type == DataType.String) return DynValue.NewString(a[0].String);
+                        if (a[0].Type == DataType.Number) return DynValue.NewString("Spell" + a[0].Number);
+                    }
+                    return DynValue.Nil;
+                });
+
+                _script.Globals["GetItemInfo"] = DynValue.NewCallback((c, a) =>
+                {
+                    if (a.Count >= 1)
+                    {
+                        if (a[0].Type == DataType.String) return DynValue.NewString(a[0].String);
+                        if (a[0].Type == DataType.Number) return DynValue.NewString("Item" + a[0].Number);
+                    }
+                    return DynValue.Nil;
+                });
+
+                // Combat/instance stubs
+                _script.Globals["InCombatLockdown"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(false));
+                _script.Globals["IsInInstance"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(false));
+
+                // Messaging / addon comms
+                _script.Globals["SendAddonMessage"] = DynValue.NewCallback((c, a) =>
+                {
+                    try
+                    {
+                        var parts = new List<string>();
+                        for (int i = 0; i < a.Count; i++) parts.Add(a[i].ToPrintString());
+                        EmitOutput("[AddonMessage] " + string.Join(" | ", parts));
+                    }
+                    catch { }
+                    return DynValue.NewBoolean(true);
+                });
+
+                // Cursor/tooltip minimal stubs
+                _script.Globals["GetCursorPosition"] = DynValue.NewCallback((c, a) => DynValue.NewTuple(DynValue.NewNumber(0), DynValue.NewNumber(0)));
+                _script.Globals["SetCursor"] = DynValue.NewCallback((c, a) => DynValue.Nil);
+
+                // Misc
+                _script.Globals["UnitName"] = DynValue.NewCallback((c, a) => DynValue.NewString("Player"));
+                _script.Globals["GetBuildInfo"] = DynValue.NewCallback((c, a) => DynValue.NewTuple(DynValue.NewString("1.0"), DynValue.NewString("build"), DynValue.NewNumber(InterfaceVersion)));
+
+                // Provide GameFontNormal/GetFont shim used by some addons
+
+            try
+            {
+                // Provide a minimal C_QuestLog with IsQuestFlaggedCompleted to avoid nil-index when used in fallbacks
+                var cql = new Table(_script);
+                cql.Set("IsQuestFlaggedCompleted", DynValue.NewCallback((c, a) => DynValue.NewBoolean(false)));
+                _script.Globals["C_QuestLog"] = DynValue.NewTable(cql);
+
+                // Provide GetRealmName
+                _script.Globals["GetRealmName"] = DynValue.NewCallback((c, a) => DynValue.NewString("Realm"));
+
+                // Provide getfenv(0) -> return global environment
+                _script.Globals["getfenv"] = DynValue.NewCallback((c, a) =>
+                {
+                    // If called with 0 or nil return _G
+                    return DynValue.NewTable(_script.Globals);
+                });
+
+                // Provide GameFontHighlight similar to GameFontNormal
+                var gh = new Table(_script);
+                gh.Set("GetFont", DynValue.NewCallback((c, a) => DynValue.NewTuple(DynValue.NewString("Arial"), DynValue.NewNumber(12), DynValue.NewString(""))));
+                _script.Globals["GameFontHighlight"] = DynValue.NewTable(gh);
+            }
+            catch { }
+                try
+                {
+                    var gf = new Table(_script);
+                    gf.Set("GetFont", DynValue.NewCallback((c, a) =>
+                    {
+                        // return fontName, height, flags
+                        return DynValue.NewTuple(DynValue.NewString("Arial"), DynValue.NewNumber(12), DynValue.NewString(""));
+                    }));
+                    _script.Globals["GameFontNormal"] = DynValue.NewTable(gf);
+                }
+                catch { }
+            }
+            catch { }
         }
 
         private (double, double) AnchorToOffset(string anchor, double w, double h)

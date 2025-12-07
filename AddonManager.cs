@@ -30,9 +30,89 @@ namespace Flux
             if (!Directory.Exists(folderPath)) return null;
 
             var addonName = Path.GetFileName(folderPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-            var runner = new LuaRunner(addonName, _frameManager, folderPath);
+
+            // Try to read TOC early to detect Interface version and Classic vs Retail hints
+            string? tocPath = null;
+            string[]? tocLines = null;
+            int detectedInterface = 0;
+            bool detectedClassic = false;
+            try
+            {
+                var tocFiles = Directory.GetFiles(folderPath, "*.toc", SearchOption.TopDirectoryOnly);
+                tocPath = tocFiles.FirstOrDefault(f => Path.GetFileNameWithoutExtension(f).Equals(addonName, StringComparison.OrdinalIgnoreCase))
+                          ?? tocFiles.FirstOrDefault();
+                if (tocPath != null)
+                {
+                    tocLines = File.ReadAllLines(tocPath);
+                    foreach (var raw in tocLines)
+                    {
+                        var line = raw.Trim();
+                        if (string.IsNullOrEmpty(line)) continue;
+                        if (!line.StartsWith("#")) continue;
+                        // Metadata/TOC directive
+                        var meta = line.TrimStart('#').Trim();
+                        // Interface: N
+                        if (meta.StartsWith("Interface:", StringComparison.OrdinalIgnoreCase) || meta.StartsWith("Interface ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var parts = meta.Split(':');
+                            if (parts.Length >= 2 && int.TryParse(parts[1].Trim(), out var iv)) detectedInterface = iv;
+                        }
+                        // Heuristics: Classic hints in TOC comments
+                        if (meta.IndexOf("classic", StringComparison.OrdinalIgnoreCase) >= 0 || meta.IndexOf("vanilla", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            detectedClassic = true;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            // Heuristic: folder path name indicates classic
+            try
+            {
+                if (!detectedClassic && folderPath.IndexOf("_classic_", StringComparison.OrdinalIgnoreCase) >= 0) detectedClassic = true;
+                if (!detectedClassic && folderPath.IndexOf("classic", StringComparison.OrdinalIgnoreCase) >= 0) detectedClassic = true;
+                if (!detectedClassic && addonName.IndexOf("vanilla", StringComparison.OrdinalIgnoreCase) >= 0) detectedClassic = true;
+            }
+            catch { }
+
+            // Create runner with detected metadata
+            var runner = new LuaRunner(addonName, _frameManager, folderPath, detectedInterface, detectedClassic);
             if (outputCallback != null)
                 runner.OnOutput += outputCallback;
+
+            // If an Ace3 folder exists in the workspace or repo, preload its libraries so addons find shared libs
+            try
+            {
+                var candidates = new List<string>();
+                // workspace current dir (dev folder)
+                candidates.Add(System.IO.Path.Combine(Directory.GetCurrentDirectory(), "Ace3"));
+                // repo relative path (three levels up, common layout used earlier)
+                candidates.Add(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "Ace3"));
+                // also check sibling folder under the same root as folderPath
+                try { candidates.Add(System.IO.Path.Combine(Path.GetDirectoryName(folderPath) ?? string.Empty, "Ace3")); } catch { }
+
+                var whitelist = new[] {
+                    "AceAddon-3.0","AceEvent-3.0","AceComm-3.0","AceConsole-3.0","AceDB-3.0",
+                    "AceGUI-3.0","AceLocale-3.0","CallbackHandler-1.0","LibStub","LibDataBroker-1.1","LibDBIcon-1.0","AceTimer-3.0","AceConfig-3.0"
+                };
+
+                foreach (var cand in candidates.Distinct())
+                {
+                    try
+                    {
+                        var full = Path.GetFullPath(cand);
+                        if (Directory.Exists(full))
+                        {
+                            outputCallback?.Invoke(this, $"[AddonManager] Preloading libs from: {full}");
+                            runner.LoadLibrariesFromDirectory(full, whitelist);
+                            break;
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
 
             // Auto-save when SavedVariables change (debounced)
             runner.OnSavedVariablesChanged += (s, name) =>
@@ -166,7 +246,24 @@ namespace Flux
                         }
                         catch { }
 
-                        runner.RunScriptFromString(code, addonName, firstArg);
+                        // If this is a library file, call with (MAJOR, MINOR=0); otherwise pass namespace table
+                        var isLib = false;
+                        try
+                        {
+                            var relNorm2 = rel.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+                            if (relNorm2.StartsWith("libs" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || relNorm2.StartsWith("Libs" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || relNorm2.StartsWith("lib" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                                isLib = true;
+                        }
+                        catch { }
+
+                        if (isLib)
+                        {
+                            runner.RunScriptFromString(code, addonName, firstArg, isLibraryFile: true, libraryMinor: 0, rel);
+                        }
+                        else
+                        {
+                            runner.RunScriptFromString(code, addonName, null, isLibraryFile: false, libraryMinor: 0, rel);
+                        }
                 }
                 catch (Exception ex)
                 {
