@@ -14,6 +14,8 @@ namespace Flux
     public class VisualFrame
     {
         public string Id { get; }
+        // Closure invoked when an 'OnEvent' script is set via frame:SetScript("OnEvent", fn)
+        public Closure? OnEvent { get; set; }
         public double X { get; set; }
         public double Y { get; set; }
         public double Width { get; set; } = 100;
@@ -36,6 +38,9 @@ namespace Flux
         public Avalonia.Controls.Image[]? NineRects { get; set; }
         public LuaRunner Owner { get; }
 
+        // Map of eventName -> wrapper closure stored when RegisterEvent is called
+        public Dictionary<string, Closure>? RegisteredEventWrappers { get; set; }
+
         public Rectangle Visual { get; set; }
         public TextBlock? VisualText { get; set; }
 
@@ -56,6 +61,17 @@ namespace Flux
                 FontSize = FontSize
             };
             NineRects = null;
+        }
+
+        // Convert this VisualFrame into a lightweight Lua table representation.
+        // This is used by the LuaRunner when invoking frame-based event handlers to supply a 'self' table.
+        public Table ToTable(Script script)
+        {
+            var t = new Table(script);
+            t.Set("__id", DynValue.NewString(Id));
+            // expose a simple IsShown method
+            t.Set("IsShown", DynValue.NewCallback((c, a) => DynValue.NewBoolean(Visible)));
+            return t;
         }
     }
 

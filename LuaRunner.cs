@@ -123,6 +123,45 @@ namespace Flux
                     return DynValue.Nil;
                 });
 
+                // Ensure pairs and ipairs exist (MoonSharp should provide these via CoreModules.Basic, but be explicit)
+                if (_script.Globals.Get("pairs") == null || _script.Globals.Get("pairs").IsNil())
+                {
+                    _script.Globals["pairs"] = DynValue.NewCallback((c, a) =>
+                    {
+                        if (a.Count >= 1 && a[0].Type == DataType.Table)
+                        {
+                            var tbl = a[0].Table;
+                            var nextFn = _script.Globals.Get("next");
+                            return DynValue.NewTuple(nextFn, DynValue.NewTable(tbl), DynValue.Nil);
+                        }
+                        return DynValue.Nil;
+                    });
+                }
+
+                if (_script.Globals.Get("ipairs") == null || _script.Globals.Get("ipairs").IsNil())
+                {
+                    _script.Globals["ipairs"] = DynValue.NewCallback((c, a) =>
+                    {
+                        if (a.Count >= 1 && a[0].Type == DataType.Table)
+                        {
+                            var tbl = a[0].Table;
+                            // Create an iterator function that returns index, value
+                            var iterFn = DynValue.NewCallback((c2, a2) =>
+                            {
+                                if (a2.Count >= 2 && a2[1].Type == DataType.Number)
+                                {
+                                    var i = (int)a2[1].Number + 1;
+                                    var val = tbl.Get(i);
+                                    if (val.IsNotNil()) return DynValue.NewTuple(DynValue.NewNumber(i), val);
+                                }
+                                return DynValue.Nil;
+                            });
+                            return DynValue.NewTuple(iterFn, DynValue.NewTable(tbl), DynValue.NewNumber(0));
+                        }
+                        return DynValue.Nil;
+                    });
+                }
+
                 _script.Globals["tonumber"] = DynValue.NewCallback((c, a) =>
                 {
                     if (a.Count >= 1)
@@ -150,6 +189,7 @@ namespace Flux
             }
             catch { }
 
+            
             // Expose common string function aliases used by many addons (strmatch, strfind, strsub, format)
             try
             {
@@ -164,6 +204,93 @@ namespace Flux
                     maybe = st.Get("lower"); if (maybe != null) _script.Globals["strlower"] = maybe;
                     maybe = st.Get("format"); if (maybe != null) _script.Globals["format"] = maybe;
                 }
+            }
+            catch { }
+
+            // Provide a basic geterrorhandler so libraries using xpcall/errorhandler don't nil-call
+            try
+            {
+                _script.Globals["geterrorhandler"] = DynValue.NewCallback((c, a) =>
+                {
+                    // return a function that simply prints the error
+                    return DynValue.NewCallback((c2, a2) =>
+                    {
+                        try { if (a2 != null && a2.Count >= 1) EmitOutput("[Lua error handler] " + a2[0].ToPrintString()); } catch { }
+                        return DynValue.Nil;
+                    });
+                });
+            }
+            catch { }
+
+            // Provide a global safecall(func, ...) helper used widely by Ace3 libraries
+            try
+            {
+                _script.Globals["safecall"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args == null || args.Count == 0) return DynValue.NewBoolean(true);
+                    var func = args[0];
+                    if (func == null || (func.Type != DataType.Function && func.Type != DataType.ClrFunction))
+                    {
+                        // nothing to call
+                        return DynValue.NewBoolean(true);
+                    }
+
+                    // collect args after the first
+                    var callArgs = new List<DynValue>();
+                    for (int i = 1; i < args.Count; i++) callArgs.Add(args[i]);
+
+                    try
+                    {
+                        var res = _script.Call(func, callArgs.ToArray());
+                        // return true, and the function's return value(s) if any
+                        if (res == null) return DynValue.NewBoolean(true);
+                        return DynValue.NewTuple(DynValue.NewBoolean(true), res);
+                    }
+                    catch (Exception ex)
+                    {
+                        try
+                        {
+                            var handler = _script.Globals.Get("geterrorhandler");
+                            if (handler != null && handler.Type == DataType.Function)
+                            {
+                                _script.Call(handler, DynValue.NewString(ex.Message));
+                            }
+                        }
+                        catch { }
+                        return DynValue.NewTuple(DynValue.NewBoolean(false), DynValue.NewString(ex.Message));
+                    }
+                });
+            }
+            catch { }
+
+            // Provide IsLoggedIn shim (return true so AceAddon enable queue runs)
+            try { _script.Globals["IsLoggedIn"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(true)); } catch { }
+
+            // Provide hooksecurefunc stub (used by AceGUI widgets) — just no-op the hook
+            try { _script.Globals["hooksecurefunc"] = DynValue.NewCallback((c, a) => DynValue.Nil); } catch { }
+
+            // Provide ChatEdit_InsertLink stub (used by AceGUI EditBox)
+            try { _script.Globals["ChatEdit_InsertLink"] = DynValue.NewCallback((c, a) => DynValue.Nil); } catch { }
+
+            // Provide GetTime and GetFramerate shims used by many libraries (ChatThrottleLib expects these)
+            try
+            {
+                _script.Globals["GetTime"] = DynValue.NewCallback((c, a) =>
+                {
+                    // return seconds with fractional part
+                    var ms = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    return DynValue.NewNumber(ms / 1000.0);
+                });
+
+                _script.Globals["GetFramerate"] = DynValue.NewCallback((c, a) =>
+                {
+                    // Provide a reasonable default framerate so ChatThrottleLib comparisons don't see nil
+                    return DynValue.NewNumber(60);
+                });
+
+                // Provide SendChatMessage / SendAddonMessage stubs so libraries can call them
+                _script.Globals["SendChatMessage"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(true));
+                _script.Globals["SendAddonMessage"] = DynValue.NewCallback((c, a) => DynValue.NewBoolean(true));
             }
             catch { }
 
@@ -235,6 +362,66 @@ namespace Flux
 
                 // alias
                 _script.Globals["securecall"] = _script.Globals["securecallfunction"];
+            }
+            catch { }
+
+            // Provide pcall/xpcall shims if missing to support libraries using protected calls
+            try
+            {
+                _script.Globals["pcall"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 1 && (args[0].Type == DataType.Function || args[0].Type == DataType.ClrFunction))
+                    {
+                        try
+                        {
+                            var func = args[0].Type == DataType.Function ? (object)args[0].Function : args[0];
+                            // Call and return true + results
+                            if (args[0].Type == DataType.Function)
+                            {
+                                var res = _script.Call(args[0].Function);
+                                return DynValue.NewTuple(DynValue.NewBoolean(true), res ?? DynValue.Nil);
+                            }
+                        }
+                        catch (ScriptRuntimeException ex)
+                        {
+                            return DynValue.NewTuple(DynValue.NewBoolean(false), DynValue.NewString(ex.Message));
+                        }
+                        catch (Exception ex)
+                        {
+                            return DynValue.NewTuple(DynValue.NewBoolean(false), DynValue.NewString(ex.Message));
+                        }
+                    }
+                    return DynValue.NewTuple(DynValue.NewBoolean(false));
+                });
+
+                _script.Globals["xpcall"] = DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 2 && (args[0].Type == DataType.Function || args[0].Type == DataType.ClrFunction))
+                    {
+                        var func = args[0];
+                        var handler = args[1];
+                        try
+                        {
+                            var res = _script.Call(func.Function);
+                            return DynValue.NewTuple(DynValue.NewBoolean(true), res ?? DynValue.Nil);
+                        }
+                        catch (ScriptRuntimeException ex)
+                        {
+                            try
+                            {
+                                if (handler != null && handler.Type == DataType.Function) _script.Call(handler.Function, DynValue.NewString(ex.Message));
+                            }
+                            catch { }
+                            return DynValue.NewTuple(DynValue.NewBoolean(false), DynValue.NewString(ex.Message));
+                        }
+                        catch (Exception ex)
+                        {
+                            try { if (handler != null && handler.Type == DataType.Function) _script.Call(handler.Function, DynValue.NewString(ex.Message)); } catch { }
+                            return DynValue.NewTuple(DynValue.NewBoolean(false), DynValue.NewString(ex.Message));
+                        }
+                    }
+                    return DynValue.NewTuple(DynValue.NewBoolean(false));
+                });
             }
             catch { }
 
@@ -718,29 +905,29 @@ namespace Flux
                 t.Set("SetScript", DynValue.NewCallback((c, a) =>
                 {
                     if (vf == null) return DynValue.Nil;
-                    if (a.Count >= 2 && a[0].Type == DataType.String && (a[1].Type == DataType.Function || a[1].Type == DataType.ClrFunction))
+                    // Support both f:SetScript("OnClick", fn) and f.SetScript(f, "OnClick", fn)
+                    int argIndex = 0;
+                    DynValue scriptNameDv = null;
+                    DynValue funcDv = null;
+                    if (a.Count >= 2 && a[0].Type == DataType.String)
                     {
-                        var scriptName = a[0].String;
-                        if (scriptName == "OnClick")
-                        {
-                            vf.OnClick = a[1].Function;
-                        }
-                        else if (scriptName == "OnUpdate")
-                        {
-                            vf.OnUpdate = a[1].Function;
-                        }
-                        else if (scriptName == "OnEnter")
-                        {
-                            vf.OnEnter = a[1].Function;
-                        }
-                        else if (scriptName == "OnLeave")
-                        {
-                            vf.OnLeave = a[1].Function;
-                        }
-                        else if (scriptName == "OnEvent")
-                        {
-                            vf.OnEvent = a[1].Function;
-                        }
+                        scriptNameDv = a[0];
+                        funcDv = a[1];
+                    }
+                    else if (a.Count >= 3 && a[0].Type == DataType.Table && a[1].Type == DataType.String)
+                    {
+                        scriptNameDv = a[1];
+                        funcDv = a[2];
+                    }
+
+                    if (scriptNameDv != null && funcDv != null && (funcDv.Type == DataType.Function || funcDv.Type == DataType.ClrFunction))
+                    {
+                        var scriptName = scriptNameDv.String;
+                        if (scriptName == "OnClick") vf.OnClick = funcDv.Function;
+                        else if (scriptName == "OnUpdate") vf.OnUpdate = funcDv.Function;
+                        else if (scriptName == "OnEnter") vf.OnEnter = funcDv.Function;
+                        else if (scriptName == "OnLeave") vf.OnLeave = funcDv.Function;
+                        else if (scriptName == "OnEvent") vf.OnEvent = funcDv.Function;
                     }
                     return DynValue.Nil;
                 }));
@@ -749,10 +936,13 @@ namespace Flux
                 t.Set("RegisterEvent", DynValue.NewCallback((c, a) =>
                 {
                     if (vf == null) return DynValue.Nil;
-                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    // Support both f:RegisterEvent("EVENT") and f.RegisterEvent(f, "EVENT")
+                    string? ev = null;
+                    if (a.Count >= 1 && a[0].Type == DataType.String) ev = a[0].String;
+                    else if (a.Count >= 2 && a[0].Type == DataType.Table && a[1].Type == DataType.String) ev = a[1].String;
+
+                    if (ev != null)
                     {
-                        var ev = a[0].String;
-                        // wrap the frame's OnEvent handler so it receives (self, event, ...)
                         if (vf.OnEvent != null)
                         {
                             var wrapper = DynValue.NewCallback((ctx2, cbArgs) =>
@@ -772,13 +962,11 @@ namespace Flux
 
                             if (!_eventHandlers.ContainsKey(ev)) _eventHandlers[ev] = new List<Closure>();
                             _eventHandlers[ev].Add(wrapper.Function);
-                            // store wrapper for potential unregister
                             vf.RegisteredEventWrappers ??= new Dictionary<string, Closure>();
                             vf.RegisteredEventWrappers[ev] = wrapper.Function;
                         }
                         else
                         {
-                            // no OnEvent set yet; still ensure an entry exists so libraries don't error
                             if (!_eventHandlers.ContainsKey(ev)) _eventHandlers[ev] = new List<Closure>();
                         }
                     }
@@ -802,6 +990,19 @@ namespace Flux
 
                 // Provide reference to the C# frame id (for debugging)
                 t.Set("__id", DynValue.NewString(vf?.Id ?? string.Empty));
+
+                // Diagnostic: list methods on the returned table for easier debugging
+                try
+                {
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append("[LuaRunner-Diag] CreateFrame returning table methods: ");
+                    foreach (var p in t.Pairs)
+                    {
+                        sb.AppendFormat("{0}({1}) ", p.Key.Type == DataType.String ? p.Key.String : p.Key.ToPrintString(), p.Value.Type);
+                    }
+                    EmitOutput(sb.ToString());
+                }
+                catch { }
 
                 return DynValue.NewTable(t);
             }));
