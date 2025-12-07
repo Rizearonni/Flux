@@ -493,17 +493,11 @@ namespace Flux
                                         }
                                         if (!string.IsNullOrEmpty(path))
                                         {
-                                            // Try to resolve the selected path to a usable filesystem path
-                                            var resolved = ResolveSelectedPath(path);
-                                            if (!string.IsNullOrEmpty(resolved))
+                                            // Try to resolve the selected path to a usable filesystem path and load it.
+                                            var loaded = await TryLoadAddonPathAsync(path).ConfigureAwait(true);
+                                            if (!loaded)
                                             {
-                                                AppendToConsole($"[Toolbar] Selected: {resolved}");
-                                                _addonManager?.LoadAddonFromFolder(resolved, LuaRunner_OnOutput);
-                                            }
-                                            else
-                                            {
-                                                AppendToConsole($"[Toolbar] Selected (unresolved): {path}");
-                                                _addonManager?.LoadAddonFromFolder(path, LuaRunner_OnOutput);
+                                                AppendToConsole($"[Toolbar] Could not load addon from selection: {path}");
                                             }
                                             handled = true;
                                             break;
@@ -524,16 +518,10 @@ namespace Flux
 #pragma warning restore CS0618
                     if (!string.IsNullOrEmpty(path))
                     {
-                        var resolved = ResolveSelectedPath(path);
-                        if (!string.IsNullOrEmpty(resolved))
+                        var loaded = await TryLoadAddonPathAsync(path).ConfigureAwait(true);
+                        if (!loaded)
                         {
-                            AppendToConsole($"[Toolbar] Selected: {resolved}");
-                            _addonManager?.LoadAddonFromFolder(resolved, LuaRunner_OnOutput);
-                        }
-                        else
-                        {
-                            AppendToConsole($"[Toolbar] Selected: {path}");
-                            _addonManager?.LoadAddonFromFolder(path, LuaRunner_OnOutput);
+                            AppendToConsole($"[Toolbar] Could not load addon from: {path}");
                         }
                     }
                     else
@@ -551,6 +539,78 @@ namespace Flux
         private void SettingsButton_Click(object? sender, RoutedEventArgs e)
         {
             AppendToConsole("[Toolbar] Settings clicked — (not implemented)");
+        }
+
+        private async Task<bool> TryLoadAddonPathAsync(string inputPath)
+        {
+            if (string.IsNullOrEmpty(inputPath)) return false;
+
+            // First try to resolve the path
+            var resolved = ResolveSelectedPath(inputPath);
+            if (string.IsNullOrEmpty(resolved) && Directory.Exists(inputPath))
+                resolved = Path.GetFullPath(inputPath);
+
+            if (!string.IsNullOrEmpty(resolved))
+            {
+                AppendToConsole($"[Toolbar] Selected: {resolved}");
+                var runner = _addonManager?.LoadAddonFromFolder(resolved, LuaRunner_OnOutput);
+                if (runner != null)
+                {
+                    AppendToConsole($"[Toolbar] Loaded addon: {runner.AddonName}");
+                    _addonManager?.TriggerEvent("PLAYER_LOGIN");
+                    _addonManager?.SaveSavedVariables(runner.AddonName);
+                    return true;
+                }
+            }
+
+            // Try raw input path if it exists
+            if (!string.IsNullOrEmpty(inputPath) && Directory.Exists(inputPath))
+            {
+                AppendToConsole($"[Toolbar] Loading from provided path: {inputPath}");
+                var runner = _addonManager?.LoadAddonFromFolder(inputPath, LuaRunner_OnOutput);
+                if (runner != null)
+                {
+                    AppendToConsole($"[Toolbar] Loaded addon: {runner.AddonName}");
+                    _addonManager?.TriggerEvent("PLAYER_LOGIN");
+                    _addonManager?.SaveSavedVariables(runner.AddonName);
+                    return true;
+                }
+            }
+
+            // Fallback: prompt user to pick a folder (start in sample_addons if available)
+#pragma warning disable CS0618
+            var dlg = new OpenFolderDialog();
+#pragma warning restore CS0618
+            try
+            {
+                var sample = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "sample_addons"));
+                var cwd = Environment.CurrentDirectory;
+                try { if (Directory.Exists(sample)) Environment.CurrentDirectory = sample; } catch { }
+                var path = await dlg.ShowAsync(this).ConfigureAwait(true);
+                try { Environment.CurrentDirectory = cwd; } catch { }
+                if (!string.IsNullOrEmpty(path))
+                {
+                    var finalResolved = ResolveSelectedPath(path) ?? path;
+                    if (!string.IsNullOrEmpty(finalResolved) && Directory.Exists(finalResolved))
+                    {
+                        AppendToConsole($"[Toolbar] Fallback selected: {finalResolved}");
+                        var runner = _addonManager?.LoadAddonFromFolder(finalResolved, LuaRunner_OnOutput);
+                        if (runner != null)
+                        {
+                            AppendToConsole($"[Toolbar] Loaded addon: {runner.AddonName}");
+                            _addonManager?.TriggerEvent("PLAYER_LOGIN");
+                            _addonManager?.SaveSavedVariables(runner.AddonName);
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendToConsole($"[Toolbar] Fallback open error: {ex.Message}");
+            }
+
+            return false;
         }
 
         private string? ResolveSelectedPath(string path)
@@ -607,10 +667,15 @@ namespace Flux
 
                                 // Then try a shallow recursive search (limit depth via Enumerate with SearchOption.TopDirectoryOnly then AllDirectories)
                                 // Use AllDirectories but guard with try/catch for IO errors
-                                foreach (var dir in Directory.EnumerateDirectories(root, path, SearchOption.AllDirectories))
-                                {
-                                    if (Directory.Exists(dir)) return dir;
-                                }
+                                        foreach (var dir in Directory.EnumerateDirectories(root, path, SearchOption.AllDirectories))
+                                        {
+                                            AppendToConsole($"[Resolve] Checking candidate: {dir}");
+                                            if (Directory.Exists(dir))
+                                            {
+                                                AppendToConsole($"[Resolve] Found match: {dir}");
+                                                return dir;
+                                            }
+                                        }
                             }
                             catch { }
                         }
@@ -660,20 +725,33 @@ namespace Flux
                             };
                             foreach (var tp in tryPaths)
                             {
-                                if (!Directory.Exists(tp)) continue;
-                                // direct child
-                                var direct = Path.Combine(tp, path);
-                                if (Directory.Exists(direct)) return direct;
-
-                                // shallow recursive search limited by wildcard enumeration
-                                try
+                                if (Directory.Exists(tp))
                                 {
-                                    foreach (var dir in Directory.EnumerateDirectories(tp, path, SearchOption.AllDirectories))
+                                    AppendToConsole($"[Resolve] Searching WoW root: {tp}");
+                                    // direct child
+                                    var direct = Path.Combine(tp, path);
+                                    AppendToConsole($"[Resolve] Checking direct child: {direct}");
+                                    if (Directory.Exists(direct))
                                     {
-                                        if (Directory.Exists(dir)) return dir;
+                                        AppendToConsole($"[Resolve] Found match: {direct}");
+                                        return direct;
                                     }
+
+                                    // shallow recursive search limited by wildcard enumeration
+                                    try
+                                    {
+                                        foreach (var dir in Directory.EnumerateDirectories(tp, path, SearchOption.AllDirectories))
+                                        {
+                                            AppendToConsole($"[Resolve] Checking candidate: {dir}");
+                                            if (Directory.Exists(dir))
+                                            {
+                                                AppendToConsole($"[Resolve] Found match: {dir}");
+                                                return dir;
+                                            }
+                                        }
+                                    }
+                                    catch { }
                                 }
-                                catch { }
                             }
                         }
                         catch { }

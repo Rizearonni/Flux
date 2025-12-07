@@ -54,35 +54,9 @@ namespace Flux
                 catch { /* ignore errors for prototype */ }
             }
 
-            // Load embedded libraries (common folders: libs, Libs, Lib, Ace3) before running addon files
-            try
-            {
-                var libDirs = new[] { "libs", "Libs", "lib", "Lib", "Libraries", "Ace3" };
-                foreach (var d in Directory.GetDirectories(folderPath))
-                {
-                    var name = Path.GetFileName(d);
-                    if (libDirs.Any(ld => string.Equals(ld, name, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        outputCallback?.Invoke(this, $"[AddonManager] Loading embedded library folder: {name}");
-                        var libFiles = Directory.GetFiles(d, "*.lua", SearchOption.AllDirectories).OrderBy(f => f);
-                        foreach (var lf in libFiles)
-                        {
-                            try
-                            {
-                                var rel = Path.GetRelativePath(folderPath, lf);
-                                outputCallback?.Invoke(this, $"[AddonManager] Loading lib file: {rel}");
-                                var code = File.ReadAllText(lf);
-                                runner.RunScriptFromString(code, addonName);
-                            }
-                            catch (Exception ex)
-                            {
-                                outputCallback?.Invoke(this, $"[AddonManager] Failed to load lib file {lf}: {ex.Message}");
-                            }
-                        }
-                    }
-                }
-            }
-            catch { }
+            // NOTE: Embedded libraries will be loaded according to the TOC order if present.
+            // Pre-loading them here caused duplicate execution when TOC also listed the same files.
+            // We'll only special-case loading libs when no TOC is present (below).
 
             // Determine files to execute. Prefer a .toc file (preserves addon-defined order).
             var filesToRun = new List<string>();
@@ -122,9 +96,47 @@ namespace Flux
                 }
                 else
                 {
-                    // No TOC: fall back to loading all .lua files recursively in deterministic order
-                    outputCallback?.Invoke(this, "[AddonManager] No TOC found — loading all .lua files recursively");
-                    filesToRun.AddRange(Directory.GetFiles(folderPath, "*.lua", SearchOption.AllDirectories).OrderBy(f => f));
+                    // No TOC: fall back to loading embedded libs first (if present), then all .lua files recursively
+                    outputCallback?.Invoke(this, "[AddonManager] No TOC found — loading embedded libs then all .lua files recursively");
+                    var libDirs = new[] { "libs", "Libs", "lib", "Lib", "Libraries", "Ace3" };
+                    var added = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    // Load lib folders first (if they exist)
+                    foreach (var d in Directory.GetDirectories(folderPath))
+                    {
+                        var name = Path.GetFileName(d);
+                        if (libDirs.Any(ld => string.Equals(ld, name, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            outputCallback?.Invoke(this, $"[AddonManager] Loading embedded library folder: {name}");
+                            var libFiles = Directory.GetFiles(d, "*.lua", SearchOption.AllDirectories).OrderBy(f => f);
+                            foreach (var lf in libFiles)
+                            {
+                                try
+                                {
+                                    filesToRun.Add(lf);
+                                    added.Add(Path.GetFullPath(lf));
+                                    outputCallback?.Invoke(this, $"[AddonManager] Queued lib file: {Path.GetRelativePath(folderPath, lf)}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    outputCallback?.Invoke(this, $"[AddonManager] Failed to queue lib file {lf}: {ex.Message}");
+                                }
+                            }
+                        }
+                    }
+
+                    // Then add remaining .lua files, skipping those already queued
+                    var all = Directory.GetFiles(folderPath, "*.lua", SearchOption.AllDirectories).OrderBy(f => f);
+                    foreach (var f in all)
+                    {
+                        try
+                        {
+                            var full = Path.GetFullPath(f);
+                            if (added.Contains(full)) continue;
+                            filesToRun.Add(f);
+                        }
+                        catch { filesToRun.Add(f); }
+                    }
                 }
             }
             catch (Exception ex)
@@ -135,14 +147,26 @@ namespace Flux
             }
 
             // Execute collected files in order
-            foreach (var f in filesToRun)
+                foreach (var f in filesToRun)
             {
                 try
                 {
                     var rel = Path.GetRelativePath(folderPath, f);
                     outputCallback?.Invoke(this, $"[AddonManager] Executing: {rel}");
                     var code = File.ReadAllText(f);
-                    runner.RunScriptFromString(code, addonName);
+                        // If this is an embedded library (under libs/ or Libs/), pass the library's base name
+                        string? firstArg = null;
+                        try
+                        {
+                            var relNorm = rel.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+                            if (relNorm.StartsWith("libs" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || relNorm.StartsWith("Libs" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || relNorm.StartsWith("lib" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                            {
+                                firstArg = Path.GetFileNameWithoutExtension(f);
+                            }
+                        }
+                        catch { }
+
+                        runner.RunScriptFromString(code, addonName, firstArg);
                 }
                 catch (Exception ex)
                 {

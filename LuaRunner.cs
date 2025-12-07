@@ -13,6 +13,7 @@ namespace Flux
 {
     public class LuaRunner
     {
+        private readonly Dictionary<string, Table> _addonNamespaces = new();
         private Script _script;
         private readonly Dictionary<string, Table> _libRegistry = new();
         private readonly Dictionary<string, Dictionary<string, Closure>> _aceRegisteredHandlers = new();
@@ -47,8 +48,9 @@ namespace Flux
             AddonName = addonName;
             _addonFolder = addonFolder;
 
-            // Create script with no core modules for sandboxing
-            _script = new Script(CoreModules.None);
+            // Create script with common core modules so libraries have standard Lua functions
+            // Enable Basic, Table, String, Math and Coroutine modules (safe subset)
+            _script = new Script(CoreModules.Basic | CoreModules.Table | CoreModules.String | CoreModules.Math | CoreModules.Coroutine);
 
             // Create saved variables table with metatable to detect writes
             InitializeSavedVariablesTable(null);
@@ -421,6 +423,34 @@ namespace Flux
             }));
 
             _script.Globals["WoW"] = DynValue.NewTable(wowTable);
+            // Expose common WoW globals for compatibility: CreateFrame, GetTime, RegisterEvent and UIParent
+            try
+            {
+                var create = wowTable.Get("CreateFrame");
+                if (create != null) _script.Globals["CreateFrame"] = create;
+            }
+            catch { }
+            try
+            {
+                var gt = wowTable.Get("GetTime");
+                if (gt != null) _script.Globals["GetTime"] = gt;
+            }
+            catch { }
+            try
+            {
+                var reg = wowTable.Get("RegisterEvent");
+                if (reg != null) _script.Globals["RegisterEvent"] = reg;
+            }
+            catch { }
+
+            try
+            {
+                // Provide a simple UIParent table so code referencing it doesn't nil-index
+                var uiParent = new Table(_script);
+                uiParent.Set("__name", DynValue.NewString("UIParent"));
+                _script.Globals["UIParent"] = DynValue.NewTable(uiParent);
+            }
+            catch { }
         }
 
         private void InitializeLibStub()
@@ -764,12 +794,24 @@ namespace Flux
             catch { }
         }
 
-        public void RunScriptFromString(string code, string addonName)
+        public void RunScriptFromString(string code, string addonName, string? firstVarArg = null)
         {
             try
             {
-                // Execute the code directly in the script's environment
-                _script.DoString(code);
+                // Load the chunk and call it with (addonName, namespaceTable) like WoW does (local name, ns = ...)
+                var func = _script.LoadString(code);
+                Table ns;
+                if (!_addonNamespaces.TryGetValue(addonName, out ns))
+                {
+                    ns = new Table(_script);
+                    _addonNamespaces[addonName] = ns;
+                }
+
+                // Determine first vararg to pass: library files may need their own MAJOR name
+                var firstArg = firstVarArg ?? addonName;
+
+                // Call the loaded chunk with (firstArg, namespaceTable)
+                _script.Call(func, DynValue.NewString(firstArg), DynValue.NewTable(ns));
                 EmitOutput($"[Lua] Script {addonName} executed.");
             }
             catch (ScriptRuntimeException ex)
