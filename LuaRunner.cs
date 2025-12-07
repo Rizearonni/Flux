@@ -15,7 +15,7 @@ namespace Flux
     {
         // preserved closure for preregistered AceAddon.NewAddon so library-created tables
         // that overwrite our registry still get a callable NewAddon injected.
-        private DynValue _preregisteredAceAddonNewAddon = null;
+        private DynValue? _preregisteredAceAddonNewAddon = null;
         private readonly Dictionary<string, Table> _addonNamespaces = new();
         private Script _script;
         private FrameManager? _frameManager;
@@ -25,7 +25,19 @@ namespace Flux
         private readonly Dictionary<string, Dictionary<int, System.Timers.Timer>> _aceTimers = new();
         private int _nextTimerId = 1;
         private Dictionary<string, List<Closure>> _eventHandlers = new();
-        private Table _savedVarsTable;
+        // Track which chunks we've executed to avoid re-running the same file repeatedly
+        private readonly HashSet<string> _executedChunks = new(StringComparer.OrdinalIgnoreCase);
+        // Track which addons we've cleared once to avoid repeated removal during
+        // multi-chunk library loads. Clearing should only happen once per overall
+        // addon load to avoid re-init loops.
+        private readonly HashSet<string> _clearedAddons = new(StringComparer.OrdinalIgnoreCase);
+        // Stop flag to allow cooperative shutdown from UI
+        private volatile bool _stopping = false;
+        // Monotonic execution sequence for chunk executions (helps trace repeated runs)
+        private long _execSequence = 0;
+        // Throttle state for noisy NewAddon wrapper diagnostics (per-key last emit time)
+        private readonly Dictionary<string, DateTime> _lastNewAddonLog = new();
+        private Table? _savedVarsTable;
         public string AddonName { get; }
 
         public event EventHandler<string>? OnSavedVariablesChanged;
@@ -40,6 +52,43 @@ namespace Flux
             }
             catch { }
             try { Console.WriteLine(s); } catch { }
+        }
+        // Emit a message but throttle repeated messages per-key to reduce noise.
+        private void EmitThrottled(string key, string message, int msInterval = 5000)
+        {
+            try
+            {
+                var now = DateTime.UtcNow;
+                if (!_lastNewAddonLog.TryGetValue(key, out var last) || (now - last).TotalMilliseconds > msInterval)
+                {
+                    _lastNewAddonLog[key] = now;
+                    EmitOutput(message);
+                }
+            }
+            catch { }
+        }
+        // Request cooperative stop of the runner: stops timers and prevents further work
+        public void Stop()
+        {
+            try
+            {
+                _stopping = true;
+                EmitOutput("[LuaRunner] Stop requested");
+                // stop/clear any active timers
+                try
+                {
+                    foreach (var kv in _aceTimers)
+                    {
+                        foreach (var tkv in kv.Value.Values)
+                        {
+                            try { tkv.Stop(); tkv.Dispose(); } catch { }
+                        }
+                    }
+                    _aceTimers.Clear();
+                }
+                catch { }
+            }
+            catch { }
         }
         private readonly string? _addonFolder;
         // Public accessor for the addon folder the runner was created with
@@ -107,7 +156,6 @@ namespace Flux
                     if (a.Count >= 1 && a[0].Type == DataType.Table)
                     {
                         var tbl = a[0].Table;
-                        var first = true;
                         DynValue lastKey = DynValue.Nil;
                         if (a.Count >= 2) lastKey = a[1];
                         foreach (var p in tbl.Pairs)
@@ -217,10 +265,27 @@ namespace Flux
             {
                 _script.Globals["geterrorhandler"] = DynValue.NewCallback((c, a) =>
                 {
-                    // return a function that simply prints the error
+                    // return a function that prints errors, but suppresses noisy AceLocale missing-entry messages
                     return DynValue.NewCallback((c2, a2) =>
                     {
-                        try { if (a2 != null && a2.Count >= 1) EmitOutput("[Lua error handler] " + a2[0].ToPrintString()); } catch { }
+                        try
+                        {
+                            if (a2 != null && a2.Count >= 1)
+                            {
+                                var txt = a2[0].ToPrintString() ?? string.Empty;
+                                // suppress repetitive AceLocale missing-entry noise
+                                if (txt.IndexOf("AceLocale-3.0:", StringComparison.OrdinalIgnoreCase) >= 0 && txt.IndexOf("Missing entry", StringComparison.OrdinalIgnoreCase) >= 0)
+                                {
+                                    // emit a single condensed notice instead of flooding logs
+                                    EmitOutput("[Lua error handler] AceLocale-3.0: missing entries suppressed (use real locale files for translations)");
+                                }
+                                else
+                                {
+                                    EmitOutput("[Lua error handler] " + txt);
+                                }
+                            }
+                        }
+                        catch { }
                         return DynValue.Nil;
                     });
                 });
@@ -514,6 +579,8 @@ namespace Flux
             try { _script.Globals["UnitClass"] = DynValue.NewCallback((c,a) => DynValue.NewTuple(DynValue.NewString("Warrior"), DynValue.NewString("WARRIOR"))); } catch { }
             try { _script.Globals["UnitRace"] = DynValue.NewCallback((c,a) => DynValue.NewTuple(DynValue.NewString("Human"), DynValue.NewString("Human"))); } catch { }
             try { _script.Globals["UnitFactionGroup"] = DynValue.NewCallback((c,a) => DynValue.NewString("Alliance")); } catch { }
+            // Provide getfenv for addons that use getfenv(0) to access the global table
+            try { _script.Globals["getfenv"] = DynValue.NewCallback((c, a) => { return DynValue.NewTable(_script.Globals); }); } catch { }
             // table helpers commonly expected by WoW addons
             try
             {
@@ -619,6 +686,109 @@ namespace Flux
             // Initialize a minimal LibStub implementation so embedded libs (Ace3) can register
             InitializeLibStub();
 
+            // Provide a minimal AceLocale-3.0 fallback so libraries that request
+            // localized strings don't spam the error handler with missing entries.
+            try
+            {
+                var _aceLocaleTables = new Dictionary<string, Table>();
+                var aceLocaleTbl = new Table(_script);
+
+                aceLocaleTbl.Set("NewLocale", DynValue.NewCallback((ctx, args) =>
+                {
+                    try
+                    {
+                        // Accept both colon and dot invocation shapes. Find the first two string args
+                        // as (addon, locale). If only addon is provided, create a fallback locale table.
+                        string? addon = null;
+                        string? locale = null;
+
+                        for (int i = 0; i < args.Count; i++)
+                        {
+                            if (args[i] != null && args[i].Type == DataType.String)
+                            {
+                                if (addon == null) addon = args[i].String;
+                                else if (locale == null) { locale = args[i].String; break; }
+                            }
+                        }
+
+                        if (string.IsNullOrEmpty(addon)) return DynValue.Nil;
+
+                        // Create or return per-addon locale table. Always attach a safe __index
+                        if (!_aceLocaleTables.ContainsKey(addon))
+                        {
+                            var tbl = new Table(_script);
+                            var mt = new Table(_script);
+                            mt.Set("__index", DynValue.NewCallback((c2, a2) =>
+                            {
+                                try
+                                {
+                                    if (a2.Count >= 2 && a2[1].Type == DataType.String) return DynValue.NewString(a2[1].String);
+                                }
+                                catch { }
+                                return DynValue.NewString(string.Empty);
+                            }));
+                            tbl.MetaTable = mt;
+                            _aceLocaleTables[addon] = tbl;
+                        }
+
+                        return DynValue.NewTable(_aceLocaleTables[addon]);
+                    }
+                    catch { return DynValue.Nil; }
+                }));
+
+                aceLocaleTbl.Set("GetLocale", DynValue.NewCallback((ctx, args) =>
+                {
+                    try
+                    {
+                        // Accept both colon and dot invocation shapes.
+                        // Get first string arg as addon name, or second if called as method (self, addon)
+                        string? addon = null;
+                        bool silent = false;
+
+                        if (args.Count >= 1)
+                        {
+                            if (args[0] != null && args[0].Type == DataType.String) addon = args[0].String;
+                            else if (args[0] != null && args[0].Type == DataType.Table && args.Count >= 2 && args[1].Type == DataType.String) addon = args[1].String;
+                        }
+
+                        // If a trailing boolean provided, treat as silent flag
+                        if (args.Count >= 1)
+                        {
+                            var last = args[args.Count - 1];
+                            if (last != null && last.Type == DataType.Boolean) silent = last.Boolean;
+                        }
+
+                        if (string.IsNullOrEmpty(addon)) return DynValue.Nil;
+
+                        // If no table exists, create a safe fallback table instead of throwing.
+                        if (!_aceLocaleTables.ContainsKey(addon))
+                        {
+                            var tbl = new Table(_script);
+                            var mt = new Table(_script);
+                            mt.Set("__index", DynValue.NewCallback((c2, a2) =>
+                            {
+                                try
+                                {
+                                    if (a2.Count >= 2 && a2[1].Type == DataType.String) return DynValue.NewString(a2[1].String);
+                                }
+                                catch { }
+                                return DynValue.NewString(string.Empty);
+                            }));
+                            tbl.MetaTable = mt;
+                            _aceLocaleTables[addon] = tbl;
+                        }
+
+                        return DynValue.NewTable(_aceLocaleTables[addon]);
+                    }
+                    catch { return DynValue.Nil; }
+                }));
+
+                // Expose globally and mirror into our lib registry so LibStub("AceLocale-3.0") finds it
+                _script.Globals["AceLocale-3.0"] = DynValue.NewTable(aceLocaleTbl);
+                try { _libRegistry["AceLocale-3.0"] = aceLocaleTbl; } catch { }
+            }
+            catch { }
+
             // Pre-create ChatThrottleLib table so libraries that capture it at load
             // time (like AceComm) get a stable table that will be populated when
             // the real ChatThrottleLib chunk runs.
@@ -640,11 +810,11 @@ namespace Flux
             {
                 VisualFrame? minimapVf = null;
                 if (_frameManager != null) minimapVf = _frameManager.CreateFrame(this);
-                if (minimapVf != null)
+                    if (minimapVf != null)
                 {
                     minimapVf.Text = "Minimap";
                     minimapVf.Width = 100; minimapVf.Height = 100;
-                    _frameManager?.UpdateVisual(minimapVf);
+                    _frameManager?.UpdateVisual(minimapVf!);
                 }
 
                 var mmTbl = new Table(_script);
@@ -677,6 +847,26 @@ namespace Flux
                 mmTbl.Set("SetZoom", DynValue.NewCallback((c, a) => DynValue.Nil));
 
                 _script.Globals["Minimap"] = DynValue.NewTable(mmTbl);
+            }
+            catch { }
+
+            // Provide basic font objects expected by many addons (GameFontNormal, GameFontHighlight)
+            try
+            {
+                var gfn = new Table(_script);
+                gfn.Set("GetFont", DynValue.NewCallback((c, a) =>
+                {
+                    // return fontName, size, style
+                    return DynValue.NewTuple(DynValue.NewString("Arial"), DynValue.NewNumber(12), DynValue.NewString("NORMAL"));
+                }));
+                _script.Globals["GameFontNormal"] = DynValue.NewTable(gfn);
+
+                var gfh = new Table(_script);
+                gfh.Set("GetFont", DynValue.NewCallback((c, a) =>
+                {
+                    return DynValue.NewTuple(DynValue.NewString("Arial"), DynValue.NewNumber(12), DynValue.NewString("HIGHLIGHT"));
+                }));
+                _script.Globals["GameFontHighlight"] = DynValue.NewTable(gfh);
             }
             catch { }
 
@@ -747,7 +937,7 @@ namespace Flux
                     {
                         vf.Width = a[0].Number;
                         vf.Height = a[1].Number;
-                        _frameManager?.UpdateVisual(vf);
+                        _frameManager?.UpdateVisual(vf!);
                     }
                     return DynValue.Nil;
                 }));
@@ -760,7 +950,7 @@ namespace Flux
                     {
                         vf.X = a[0].Number;
                         vf.Y = a[1].Number;
-                        _frameManager?.UpdateVisual(vf);
+                        _frameManager?.UpdateVisual(vf!);
                         return DynValue.Nil;
                     }
 
@@ -804,7 +994,7 @@ namespace Flux
                         var targetY = parentY + pay - ay + offY;
                         vf.X = targetX;
                         vf.Y = targetY;
-                        _frameManager?.UpdateVisual(vf);
+                        _frameManager?.UpdateVisual(vf!);
                     }
 
                     return DynValue.Nil;
@@ -814,7 +1004,7 @@ namespace Flux
                 {
                     if (vf == null) return DynValue.Nil;
                     vf.Visible = true;
-                        _frameManager?.UpdateVisual(vf);
+                        _frameManager?.UpdateVisual(vf!);
                     return DynValue.Nil;
                 }));
 
@@ -828,7 +1018,7 @@ namespace Flux
                 {
                     if (vf == null) return DynValue.Nil;
                     vf.Visible = false;
-                    _frameManager?.UpdateVisual(vf);
+                    _frameManager?.UpdateVisual(vf!);
                     return DynValue.Nil;
                 }));
 
@@ -839,7 +1029,7 @@ namespace Flux
                     if (a.Count >= 1 && (a[0].Type == DataType.Number || a[0].Type == DataType.Boolean))
                     {
                         vf.Opacity = a[0].Type == DataType.Number ? a[0].Number : (a[0].Boolean ? 1.0 : 0.0);
-                        _frameManager?.UpdateVisual(vf);
+                        _frameManager?.UpdateVisual(vf!);
                     }
                     return DynValue.Nil;
                 }));
@@ -851,7 +1041,7 @@ namespace Flux
                     if (a.Count >= 1 && a[0].Type == DataType.String)
                     {
                         vf.Text = a[0].String;
-                        _frameManager?.UpdateVisual(vf);
+                        _frameManager?.UpdateVisual(vf!);
                     }
                     return DynValue.Nil;
                 }));
@@ -886,7 +1076,7 @@ namespace Flux
                                         var col = Avalonia.Media.Color.Parse(colorName);
                                         vf.BackdropBrush = new SolidColorBrush(col);
                                         vf.UseNinePatch = false;
-                                        _frameManager?.UpdateVisual(vf);
+                                        _frameManager?.UpdateVisual(vf!);
                                     }
                                     catch { }
                                 }
@@ -901,7 +1091,7 @@ namespace Flux
                                         {
                                             vf.BackdropBrush = brush;
                                             vf.UseNinePatch = false;
-                                            _frameManager?.UpdateVisual(vf);
+                                            _frameManager?.UpdateVisual(vf!);
                                         }
                                     }
                                 }
@@ -958,7 +1148,7 @@ namespace Flux
                                                 vf.BackdropBrush = new ImageBrush(bmp) { Stretch = Avalonia.Media.Stretch.Fill };
                                                 EmitOutput($"[LuaRunner] Applied image brush from: {resolved}");
                                             }
-                                            _frameManager?.UpdateVisual(vf);
+                                            _frameManager?.UpdateVisual(vf!);
                                         }
                                         else
                                         {
@@ -996,7 +1186,7 @@ namespace Flux
                                     var bmp = new Bitmap(resolved);
                                     var ib = new ImageBrush(bmp);
                                     vf.BackdropBrush = ib;
-                                    _frameManager?.UpdateVisual(vf);
+                                    _frameManager?.UpdateVisual(vf!);
                                 }
                                 catch { }
                             }
@@ -1013,7 +1203,7 @@ namespace Flux
                     if (a.Count >= 1 && a[0].Type == DataType.Number)
                     {
                         vf.FontSize = a[0].Number;
-                        _frameManager?.UpdateVisual(vf);
+                        _frameManager?.UpdateVisual(vf!);
                     }
                     return DynValue.Nil;
                 }));
@@ -1022,9 +1212,8 @@ namespace Flux
                 {
                     if (vf == null) return DynValue.Nil;
                     // Support both f:SetScript("OnClick", fn) and f.SetScript(f, "OnClick", fn)
-                    int argIndex = 0;
-                    DynValue scriptNameDv = null;
-                    DynValue funcDv = null;
+                    DynValue? scriptNameDv = null;
+                    DynValue? funcDv = null;
                     if (a.Count >= 2 && a[0].Type == DataType.String)
                     {
                         scriptNameDv = a[0];
@@ -1070,7 +1259,7 @@ namespace Flux
                                 if (a2 != null && a2.Count >= 1 && a2[0].Type == DataType.String)
                                 {
                                     if (vf != null) vf.Text = a2[0].String;
-                                    _frameManager?.UpdateVisual(vf);
+                                    _frameManager?.UpdateVisual(vf!);
                                 }
                             }
                             catch { }
@@ -1099,9 +1288,17 @@ namespace Flux
                         // the texture table returned and chaining works.
                         try
                         {
-                            var mt = new Table(_script);
-                            mt.Set("__call", DynValue.NewCallback((c2, a2) => DynValue.NewTable(tex)));
-                            tex.MetaTable = mt;
+                                var mt = new Table(_script);
+                                mt.Set("__call", DynValue.NewCallback((c2, a2) => DynValue.NewTable(tex)));
+                                try
+                                {
+                                    // Also provide an __index table that ensures SetTexCoord is always reachable
+                                    var idx = new Table(_script);
+                                    idx.Set("SetTexCoord", setTexCoordFn);
+                                    mt.Set("__index", DynValue.NewTable(idx));
+                                }
+                                catch { }
+                                tex.MetaTable = mt;
                         }
                         catch { }
 
@@ -1150,9 +1347,25 @@ namespace Flux
                                     // ensure __call metamethod returns the texture table so chaining works
                                     try
                                     {
-                                        var mt = inner.MetaTable ?? new Table(_script);
-                                        mt.Set("__call", DynValue.NewCallback((c2, a2) => DynValue.NewTable(inner)));
-                                        inner.MetaTable = mt;
+                                            var mt = inner.MetaTable ?? new Table(_script);
+                                            mt.Set("__call", DynValue.NewCallback((c2, a2) => DynValue.NewTable(inner)));
+                                            try
+                                            {
+                                                // Ensure __index table includes SetTexCoord so lookups via metatable succeed
+                                                var idx = mt.Get("__index");
+                                                if (idx == null || idx.IsNil())
+                                                {
+                                                    var idt = new Table(_script);
+                                                    idt.Set("SetTexCoord", DynValue.NewCallback((c2, a2) => DynValue.Nil));
+                                                    mt.Set("__index", DynValue.NewTable(idt));
+                                                }
+                                                else if (idx.Type == DataType.Table)
+                                                {
+                                                    idx.Table.Set("SetTexCoord", DynValue.NewCallback((c2, a2) => DynValue.Nil));
+                                                }
+                                            }
+                                            catch { }
+                                            inner.MetaTable = mt;
                                     }
                                     catch { }
                                     EmitOutput($"[LuaRunner-Diag] Injected fallback SetTexCoord into texture for frame={vf?.Id}");
@@ -1292,7 +1505,7 @@ namespace Flux
                                 vf.Y = parentVf.Y;
                                 vf.Width = parentVf.Width;
                                 vf.Height = parentVf.Height;
-                                _frameManager?.UpdateVisual(vf);
+                                _frameManager?.UpdateVisual(vf!);
                             }
                         }
                         catch { }
@@ -1431,49 +1644,52 @@ namespace Flux
                     {
                         // expose name to Lua table and show as label in the visual
                         t.Set("__name", DynValue.NewString(frameName));
-                        vf.Text = frameName;
-
-                        // Ensure a reasonable default size for common frames
-                        if (vf.Width <= 0) vf.Width = 120;
-                        if (vf.Height <= 0) vf.Height = 40;
-
-                        var canvasSize = _frameManager?.GetCanvasSize() ?? new Size(800, 600);
-
-                        // Basic WoW-like placements (top-left origin):
-                        // PlayerFrame: bottom-left, Minimap: top-right, PartyMemberFrameN: stacked left area, ChatFrame: bottom-left large
-                        if (frameName.Equals("PlayerFrame", StringComparison.OrdinalIgnoreCase))
+                        if (vf != null)
                         {
-                            vf.X = 20;
-                            vf.Y = canvasSize.Height - vf.Height - 20;
-                        }
-                        else if (frameName.IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            // round minimap visually handled in FrameManager by checking vf.Text == "Minimap"
-                            vf.Width = Math.Max(vf.Width, 100);
-                            vf.Height = Math.Max(vf.Height, 100);
-                            vf.X = canvasSize.Width - vf.Width - 20;
-                            vf.Y = 20;
-                        }
-                        else if (frameName.StartsWith("PartyMemberFrame", StringComparison.OrdinalIgnoreCase))
-                        {
-                            // Party members stack vertically to the right of player frame area
-                            var m = System.Text.RegularExpressions.Regex.Match(frameName, "\\d+");
-                            int idx = 1;
-                            if (m.Success) int.TryParse(m.Value, out idx);
-                            double baseX = 20 + 140; // to the right of a typical player frame
-                            double baseY = canvasSize.Height - vf.Height - 20 - (idx - 1) * (vf.Height + 8);
-                            vf.X = baseX;
-                            vf.Y = baseY;
-                        }
-                        else if (frameName.StartsWith("ChatFrame", StringComparison.OrdinalIgnoreCase))
-                        {
-                            vf.Width = Math.Max(vf.Width, 340);
-                            vf.Height = Math.Max(vf.Height, 160);
-                            vf.X = 20;
-                            vf.Y = canvasSize.Height - vf.Height - 20 - 60; // leave room for player frame
-                        }
+                            vf.Text = frameName;
 
-                        _frameManager?.UpdateVisual(vf);
+                            // Ensure a reasonable default size for common frames
+                            if (vf.Width <= 0) vf.Width = 120;
+                            if (vf.Height <= 0) vf.Height = 40;
+
+                            var canvasSize = _frameManager?.GetCanvasSize() ?? new Size(800, 600);
+
+                            // Basic WoW-like placements (top-left origin):
+                            // PlayerFrame: bottom-left, Minimap: top-right, PartyMemberFrameN: stacked left area, ChatFrame: bottom-left large
+                            if (frameName.Equals("PlayerFrame", StringComparison.OrdinalIgnoreCase))
+                            {
+                                vf.X = 20;
+                                vf.Y = canvasSize.Height - vf.Height - 20;
+                            }
+                            else if (frameName.IndexOf("Minimap", StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                // round minimap visually handled in FrameManager by checking vf.Text == "Minimap"
+                                vf.Width = Math.Max(vf.Width, 100);
+                                vf.Height = Math.Max(vf.Height, 100);
+                                vf.X = canvasSize.Width - vf.Width - 20;
+                                vf.Y = 20;
+                            }
+                            else if (frameName.StartsWith("PartyMemberFrame", StringComparison.OrdinalIgnoreCase))
+                            {
+                                // Party members stack vertically to the right of player frame area
+                                var m = System.Text.RegularExpressions.Regex.Match(frameName, "\\d+");
+                                int idx = 1;
+                                if (m.Success) int.TryParse(m.Value, out idx);
+                                double baseX = 20 + 140; // to the right of a typical player frame
+                                double baseY = canvasSize.Height - vf.Height - 20 - (idx - 1) * (vf.Height + 8);
+                                vf.X = baseX;
+                                vf.Y = baseY;
+                            }
+                            else if (frameName.StartsWith("ChatFrame", StringComparison.OrdinalIgnoreCase))
+                            {
+                                vf.Width = Math.Max(vf.Width, 340);
+                                vf.Height = Math.Max(vf.Height, 160);
+                                vf.X = 20;
+                                vf.Y = canvasSize.Height - vf.Height - 20 - 60; // leave room for player frame
+                            }
+
+                            _frameManager?.UpdateVisual(vf!);
+                        }
                     }
                 }
                 catch { }
@@ -1560,7 +1776,13 @@ namespace Flux
                                 timer.Stop();
                                 Dispatcher.UIThread.Post(() =>
                                 {
-                                    try { _script.Call(func); } catch { }
+                                    try
+                                    {
+                                        var seq = System.Threading.Interlocked.Increment(ref _execSequence);
+                                        EmitOutput($"[LuaRunner-Diag] Seq={seq} C_Timer.After invoking callback after {delay}s");
+                                        try { _script.Call(func); } catch (Exception ex) { EmitOutput("[LuaRunner-Diag] C_Timer.After callback error: " + ex.Message); }
+                                    }
+                                    catch { }
                                 });
                             }
                             catch { }
@@ -1702,10 +1924,131 @@ namespace Flux
 
         }
 
+        // Generate a compact diagnostic snapshot of key globals and the lib registry
+        private string EmitRuntimeSnapshot(string context, ScriptRuntimeException? ex = null)
+        {
+            try
+            {
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"[LuaRunner-Diag] Runtime snapshot ({context})");
+                if (ex != null)
+                {
+                    var firstLine = ex.DecoratedMessage?.Split(new[] { '\n' }, StringSplitOptions.None)[0] ?? ex.Message;
+                    sb.AppendLine("[LuaRunner-Diag] Error: " + firstLine);
+                }
+
+                // Inspect a few well-known globals and libraries that commonly cause type-mismatch issues
+                string[] probeNames = new[] { "LibStub", "AceAddon-3.0", "AceGUI-3.0", "AceComm-3.0", "ChatThrottleLib", "CallbackHandler-1.0", "AceLocale-3.0", "AttuneLang" };
+                foreach (var name in probeNames)
+                {
+                    try
+                    {
+                        var dv = _script.Globals.Get(name);
+                        sb.AppendLine($"[LuaRunner-Diag] Global '{name}': {DumpDynValue(dv, 6)}");
+                    }
+                    catch (Exception e)
+                    {
+                        sb.AppendLine($"[LuaRunner-Diag] Global '{name}': <error reading> {e.Message}");
+                    }
+                }
+
+                // Snapshot lib registry summary (first N entries and detect non-table values)
+                try
+                {
+                    sb.AppendLine($"[LuaRunner-Diag] _libRegistry: count={_libRegistry.Count}");
+                    int i = 0;
+                    foreach (var kv in _libRegistry)
+                    {
+                        if (i++ >= 20) { sb.AppendLine("[LuaRunner-Diag] _libRegistry: (truncated)"); break; }
+                        try
+                        {
+                            var val = kv.Value;
+                            if (val == null) sb.AppendLine($"  - {kv.Key}: <null>");
+                            else sb.AppendLine($"  - {kv.Key}: Table keys={val.Pairs.Count()} (sample: {DumpDynValue(DynValue.NewTable(val), 4)})");
+                        }
+                        catch (Exception e)
+                        {
+                            sb.AppendLine($"  - {kv.Key}: <error inspecting> {e.Message}");
+                        }
+                    }
+                }
+                catch { }
+
+                // Quick summary of ace addons registry
+                try { sb.AppendLine($"[LuaRunner-Diag] _aceAddons: count={_aceAddons.Count}"); } catch { }
+
+                return sb.ToString();
+            }
+            catch { return string.Empty; }
+        }
+
+        private string DumpDynValue(DynValue dv, int maxEntries = 6)
+        {
+            try
+            {
+                if (dv == null || dv.IsNil()) return "<nil>";
+                switch (dv.Type)
+                {
+                    case DataType.Boolean: return $"boolean({dv.Boolean})";
+                    case DataType.Number: return $"number({dv.Number})";
+                    case DataType.String:
+                        var s = dv.String ?? string.Empty;
+                        if (s.Length > 80) s = s.Substring(0, 80) + "...";
+                        return $"string('{s}')";
+                    case DataType.Function: return "function(lua)";
+                    case DataType.ClrFunction: return "function(clr)";
+                    case DataType.Table:
+                        try
+                        {
+                            var tbl = dv.Table;
+                            var keys = new List<string>();
+                            int c = 0;
+                            foreach (var p in tbl.Pairs)
+                            {
+                                if (c++ >= maxEntries) break;
+                                var k = p.Key.ToPrintString() ?? "?";
+                                var vt = p.Value != null ? p.Value.Type.ToString() : "nil";
+                                keys.Add($"{k}:{vt}");
+                            }
+                            return $"table({tbl.Pairs.Count()} entries) sample=[{string.Join(", ", keys)}]";
+                        }
+                        catch { return "table(<error>)"; }
+                    case DataType.Tuple: return "tuple";
+                    case DataType.UserData: return "userdata";
+                    case DataType.Thread: return "thread";
+                    default: return dv.Type.ToString();
+                }
+            }
+            catch { return "<dump-error>"; }
+        }
         private void InitializeLibStub()
         {
             try
             {
+                // Ensure a given library table has a safe __index fallback that returns
+                // the missing key (string) so addons indexing locale tables don't crash.
+                void EnsureTableHasFallback(Table t)
+                {
+                    try
+                    {
+                        var mt = t.MetaTable ?? new Table(_script);
+                        var idx = mt.Get("__index");
+                        if (idx == null || idx.IsNil())
+                        {
+                            mt.Set("__index", DynValue.NewCallback((c2, a2) =>
+                            {
+                                try
+                                {
+                                    if (a2.Count >= 2 && a2[1].Type == DataType.String) return DynValue.NewString(a2[1].String);
+                                }
+                                catch { }
+                                return DynValue.NewString(string.Empty);
+                            }));
+                            t.MetaTable = mt;
+                        }
+                    }
+                    catch { }
+                }
                 var libStub = new Table(_script);
                 // Provide libs and minors tables as in real LibStub
                 var libsTbl = new Table(_script);
@@ -1755,26 +2098,142 @@ namespace Flux
                                     var finalNew = dv.Table.Get("NewAddon");
                                     if (finalNew != null && finalNew.Type != DataType.Nil)
                                     {
-                                        var captured = finalNew; // capture the original implementation
-                                        dv.Table.Set("NewAddon", DynValue.NewCallback((ctx2, args2) =>
+                                        // If NewAddon is a callable, wrap it to tolerate both ':' and '.' invocation styles.
+                                        if (finalNew.Type == DataType.Function || finalNew.Type == DataType.ClrFunction)
                                         {
-                                            try
+                                            var captured = finalNew;
+                                            dv.Table.Set("NewAddon", DynValue.NewCallback((ctx2, args2) =>
                                             {
-                                                var callArgs = new List<DynValue>();
-                                                for (int i = 0; i < args2.Count; i++) callArgs.Add(args2[i]);
-                                                if (captured.Type == DataType.Function)
+                                                try
                                                 {
-                                                    return _script.Call(captured.Function, callArgs.ToArray());
+                                                    string throttleKey = "NewAddonWrapper:unknown";
+                                                    if (args2 != null)
+                                                    {
+                                                        for (int _ai = 0; _ai < args2.Count; _ai++)
+                                                        {
+                                                            var _dv = args2[_ai];
+                                                            if (_dv != null && _dv.Type == DataType.String)
+                                                            {
+                                                                throttleKey = "NewAddonWrapper:" + _dv.String;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    System.Action<string> EmitNewAddonLog = (m) => EmitThrottled(throttleKey, m, 3000);
+
+                                                    try
+                                                    {
+                                                        var dbg = new System.Text.StringBuilder();
+                                                        dbg.Append("[LuaRunner-Diag] NewAddon wrapper invoked: capturedType=");
+                                                        dbg.Append(captured?.Type.ToString() ?? "(null)");
+                                                        dbg.Append(" argsCount="); dbg.Append(args2?.Count ?? 0);
+                                                        if (args2 != null)
+                                                        {
+                                                            for (int i = 0; i < args2.Count; i++) dbg.AppendFormat(" [{0}:{1}:{2}]", i, args2[i].Type, args2[i].ToString());
+                                                        }
+                                                        EmitNewAddonLog(dbg.ToString());
+                                                    }
+                                                    catch { }
+
+                                                    // First try direct call
+                                                    try
+                                                    {
+                                                        DynValue[] callArgs;
+                                                        if (args2 != null && args2.Count > 0)
+                                                        {
+                                                            callArgs = new DynValue[args2.Count];
+                                                            for (int i = 0; i < args2.Count; i++) callArgs[i] = args2[i];
+                                                        }
+                                                        else callArgs = Array.Empty<DynValue>();
+
+                                                        if (captured!.Type == DataType.Function) return _script.Call(captured.Function, callArgs);
+                                                        return _script.Call(captured, callArgs);
+                                                    }
+                                                    catch (Exception ex1)
+                                                    {
+                                                        try { EmitNewAddonLog("[LuaRunner-Diag] NewAddon wrapper first-call failed: " + ex1.Message); } catch { }
+
+                                                        // If error mentions already exists, return existing or create fallback
+                                                        try
+                                                        {
+                                                            if (!string.IsNullOrEmpty(ex1.Message) && ex1.Message.IndexOf("already exists", StringComparison.OrdinalIgnoreCase) >= 0)
+                                                            {
+                                                                string? addonNameFound = null;
+                                                                if (args2 != null)
+                                                                {
+                                                                    for (int ai = 0; ai < args2.Count; ai++)
+                                                                    {
+                                                                        var dv = args2[ai];
+                                                                        if (dv != null && dv.Type == DataType.String) { addonNameFound = dv.String; break; }
+                                                                    }
+                                                                }
+                                                                if (!string.IsNullOrEmpty(addonNameFound))
+                                                                {
+                                                                    if (_aceAddons.TryGetValue(addonNameFound, out var existingTbl) && existingTbl != null)
+                                                                    {
+                                                                        try { EmitNewAddonLog($"[LuaRunner-Diag] NewAddon wrapper returning existing registered addon '{addonNameFound}'"); } catch { }
+                                                                        return DynValue.NewTable(existingTbl);
+                                                                    }
+                                                                    var fallback = new Table(_script);
+                                                                    _aceAddons[addonNameFound] = fallback;
+                                                                    try { EmitNewAddonLog($"[LuaRunner-Diag] NewAddon wrapper created fallback addon table for '{addonNameFound}'"); } catch { }
+                                                                    return DynValue.NewTable(fallback);
+                                                                }
+                                                            }
+                                                        }
+                                                        catch { }
+
+                                                        // If the first arg is a table (implicit self), try shifting args and call again
+                                                        try
+                                                        {
+                                                            if (args2 != null && args2.Count >= 1 && args2[0].Type == DataType.Table)
+                                                            {
+                                                                var shifted = new List<DynValue>();
+                                                                for (int i = 1; i < args2.Count; i++) shifted.Add(args2[i]);
+                                                                if (captured!.Type == DataType.Function) return _script.Call(captured.Function, shifted.ToArray());
+                                                                return _script.Call(captured, shifted.ToArray());
+                                                            }
+                                                        }
+                                                        catch (Exception ex2)
+                                                        {
+                                                            try { EmitNewAddonLog("[LuaRunner-Diag] NewAddon wrapper retry exception: " + ex2.Message); } catch { }
+                                                        }
+
+                                                        try { EmitNewAddonLog("[LuaRunner-Diag] NewAddon wrapper first-call exception: " + ex1.Message); } catch { }
+                                                        return DynValue.Nil;
+                                                    }
                                                 }
-                                                // For ClrFunction and other callables, just call via script.Call
-                                                return _script.Call(captured, callArgs.ToArray());
-                                            }
-                                            catch (Exception ex)
+                                                catch (Exception ex)
+                                                {
+                                                    try { EmitOutput("[LuaRunner-Diag] NewAddon wrapper exception: " + ex.Message); } catch { }
+                                                }
+                                                return DynValue.Nil;
+                                            }));
+                                        }
+                                        else
+                                        {
+                                            // Non-callable NewAddon (string or other) — log and avoid wrapping.
+                                            try { EmitOutput($"[LuaRunner-Diag] Skipping wrap: libsTbl['{name}'].NewAddon is non-callable type={finalNew.Type}"); } catch { }
+                                        }
+
+                                        // Ensure __index on the metatable exposes NewAddon for colon-call lookup
+                                        try
+                                        {
+                                            var mt2 = dv.Table.MetaTable ?? new Table(_script);
+                                            var idx = mt2.Get("__index");
+                                            if (idx == null || idx.IsNil())
                                             {
-                                                try { EmitOutput("[LuaRunner-Diag] NewAddon wrapper exception: " + ex.Message); } catch { }
+                                                var idt = new Table(_script);
+                                                idt.Set("NewAddon", dv.Table.Get("NewAddon"));
+                                                mt2.Set("__index", DynValue.NewTable(idt));
                                             }
-                                            return DynValue.Nil;
-                                        }));
+                                            else if (idx.Type == DataType.Table)
+                                            {
+                                                idx.Table.Set("NewAddon", dv.Table.Get("NewAddon"));
+                                            }
+                                            dv.Table.MetaTable = mt2;
+                                        }
+                                        catch { }
                                         EmitOutput($"[LuaRunner-Diag] Wrapped NewAddon on libsTbl['{name}'] to ensure callable method semantics");
                                     }
                                 }
@@ -1801,26 +2260,102 @@ namespace Flux
                                     var finalNew = regTbl.Get("NewAddon");
                                     if (finalNew != null && finalNew.Type != DataType.Nil)
                                     {
-                                        var captured = finalNew;
-                                        regTbl.Set("NewAddon", DynValue.NewCallback((ctx2, args2) =>
+                                        if (finalNew.Type == DataType.Function || finalNew.Type == DataType.ClrFunction)
                                         {
-                                            try
+                                            var captured = finalNew;
+                                            regTbl.Set("NewAddon", DynValue.NewCallback((ctx2, args2) =>
                                             {
-                                                var callArgs = new List<DynValue>();
-                                                for (int i = 0; i < args2.Count; i++) callArgs.Add(args2[i]);
-                                                if (captured.Type == DataType.Function)
+                                                try
                                                 {
-                                                    return _script.Call(captured.Function, callArgs.ToArray());
+                                                    // Per-wrapper throttled logger (keyed by first string arg if available)
+                                                    string throttleKey_reg = "NewAddonWrapper:unknown";
+                                                    if (args2 != null)
+                                                    {
+                                                        for (int _ai = 0; _ai < args2.Count; _ai++)
+                                                        {
+                                                            var _dv = args2[_ai];
+                                                            if (_dv != null && _dv.Type == DataType.String)
+                                                            {
+                                                                throttleKey_reg = "NewAddonWrapper:" + _dv.String;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    System.Action<string> EmitNewAddonLog_reg = (m) => EmitThrottled(throttleKey_reg, m, 3000);
+
+                                                    try
+                                                    {
+                                                        // Emit invocation diagnostic for registry wrapper (throttled)
+                                                        try
+                                                        {
+                                                            var dbg = new System.Text.StringBuilder();
+                                                            dbg.Append("[LuaRunner-Diag] NewAddon(regTbl) wrapper invoked: capturedType=");
+                                                            dbg.Append(captured?.Type.ToString() ?? "(null)");
+                                                            dbg.Append(" argsCount="); dbg.Append(args2?.Count ?? 0);
+                                                            if (args2 != null)
+                                                            {
+                                                                for (int i = 0; i < args2.Count; i++) dbg.AppendFormat(" [{0}:{1}:{2}]", i, args2[i].Type, args2[i].ToString());
+                                                            }
+                                                            EmitNewAddonLog_reg(dbg.ToString());
+                                                        }
+                                                        catch { }
+
+                                                        // Try direct call first
+                                                        var callArgs = new List<DynValue>();
+                                                        if (args2 != null)
+                                                        {
+                                                            for (int i = 0; i < args2.Count; i++) callArgs.Add(args2[i]);
+                                                        }
+                                                        if (captured != null && captured.Type == DataType.Function)
+                                                        {
+                                                            return _script.Call(captured.Function, callArgs.ToArray());
+                                                        }
+                                                        return _script.Call(captured, callArgs.ToArray());
+                                                    }
+                                                    catch (Exception ex1)
+                                                    {
+                                                        try
+                                                        {
+                                                            var dbg2 = new System.Text.StringBuilder();
+                                                            dbg2.Append("[LuaRunner-Diag] NewAddon(regTbl) first-call failed: ");
+                                                            dbg2.Append(ex1.Message);
+                                                            EmitNewAddonLog_reg(dbg2.ToString());
+                                                        }
+                                                        catch { }
+
+                                                        // If direct call failed and first arg looks like self, try shifting
+                                                        try
+                                                        {
+                                                            if (args2 != null && args2.Count >= 1 && args2[0].Type == DataType.Table)
+                                                            {
+                                                                var shifted = new List<DynValue>();
+                                                                for (int i = 1; i < args2.Count; i++) shifted.Add(args2[i]);
+                                                                if (captured.Type == DataType.Function)
+                                                                {
+                                                                    return _script.Call(captured.Function, shifted.ToArray());
+                                                                }
+                                                                return _script.Call(captured, shifted.ToArray());
+                                                            }
+                                                        }
+                                                        catch (Exception ex2)
+                                                        {
+                                                            try { EmitOutput("[LuaRunner-Diag] NewAddon(regTbl) retry exception: " + ex2.Message); } catch { }
+                                                        }
+                                                        try { EmitOutput("[LuaRunner-Diag] NewAddon(regTbl) first-call exception: " + ex1.Message); } catch { }
+                                                    }
                                                 }
-                                                return _script.Call(captured, callArgs.ToArray());
-                                            }
-                                            catch (Exception ex)
-                                            {
-                                                try { EmitOutput("[LuaRunner-Diag] NewAddon(wrapper) exception: " + ex.Message); } catch { }
-                                            }
-                                            return DynValue.Nil;
-                                        }));
-                                        EmitOutput($"[LuaRunner-Diag] Wrapped NewAddon on _libRegistry['{name}'] to ensure callable method semantics");
+                                                catch (Exception ex)
+                                                {
+                                                    try { EmitOutput("[LuaRunner-Diag] NewAddon(regTbl) exception: " + ex.Message); } catch { }
+                                                }
+                                                return DynValue.Nil;
+                                            }));
+                                            EmitOutput($"[LuaRunner-Diag] Wrapped NewAddon on _libRegistry['{name}'] to ensure callable method semantics");
+                                        }
+                                        else
+                                        {
+                                            try { EmitOutput($"[LuaRunner-Diag] Skipping wrap: _libRegistry['{name}'].NewAddon is non-callable type={finalNew.Type}"); } catch { }
+                                        }
                                     }
                                 }
                                 catch { }
@@ -1869,8 +2404,8 @@ namespace Flux
                         int existingMinor = 0;
                         if (existingMinorDv != null && existingMinorDv.Type == DataType.Number) existingMinor = (int)existingMinorDv.Number;
                         if (existingMinor >= minor) return DynValue.Nil;
-
                         var t = existingDv != null && existingDv.Type == DataType.Table ? existingDv.Table : new Table(_script);
+                        try { EnsureTableHasFallback(t); } catch { }
                         t.Set("__name", DynValue.NewString(name));
                         t.Set("__minor", DynValue.NewNumber(minor));
                         libsTbl.Set(name, DynValue.NewTable(t));
@@ -1926,6 +2461,7 @@ namespace Flux
                         if (!silent)
                         {
                             var placeholder = new Table(_script);
+                            try { EnsureTableHasFallback(placeholder); } catch { }
                             placeholder.Set("__name", DynValue.NewString(name));
                             placeholder.Set("__minor", DynValue.NewNumber(0));
                             libsTbl.Set(name, DynValue.NewTable(placeholder));
@@ -2002,10 +2538,10 @@ namespace Flux
                                     var ev = a2[1].String;
 
                                     // Handler can be function or string method name
-                                    DynValue handler = null;
+                                    DynValue? handler = null;
                                     if (a2.Count >= 3) handler = a2[2];
 
-                                    Closure targetClosure = null;
+                                    Closure? targetClosure = null;
 
                                     if (handler != null && handler.Type == DataType.Function)
                                     {
@@ -2126,9 +2662,9 @@ namespace Flux
                         {
                             var objTable = a2[0].Table;
                             var ev = a2[1].String;
-                            DynValue handler = a2.Count >= 3 ? a2[2] : DynValue.Nil;
+                            DynValue? handler = a2.Count >= 3 ? a2[2] : null;
 
-                            Closure target = null;
+                            Closure? target = null;
                             if (handler != null && handler.Type == DataType.Function) target = handler.Function;
                             else if (handler != null && handler.Type == DataType.String)
                             {
@@ -2143,12 +2679,14 @@ namespace Flux
                                 {
                                     try
                                     {
-                                        var argsList = new List<DynValue> { DynValue.NewTable(objTable) };
+                                        var evList = new List<DynValue> { DynValue.NewTable(objTable) };
                                         if (cbArgs != null)
                                         {
-                                            for (int i = 0; i < cbArgs.Count; i++) argsList.Add(cbArgs[i]);
+                                            for (int i = 0; i < cbArgs.Count; i++) evList.Add(cbArgs[i]);
                                         }
-                                        _script.Call(target, argsList.ToArray());
+                                        var seq = System.Threading.Interlocked.Increment(ref _execSequence);
+                                        try { EmitOutput($"[LuaRunner-Diag] Seq={seq} AceEvent firing for addon='{objTable.Get("__name")?.String ?? ""}'"); } catch { }
+                                        _script.Call(target, evList.ToArray());
                                     }
                                     catch { }
                                     return DynValue.Nil;
@@ -2186,16 +2724,16 @@ namespace Flux
                         return DynValue.Nil;
                     }));
 
-                    _libRegistry["AceEvent-3.0"] = aceEvent;
-                    try { libsTbl.Set("AceEvent-3.0", DynValue.NewTable(aceEvent)); } catch { }
+                    _libRegistry!.TryAdd("AceEvent-3.0", aceEvent!);
+                    try { libsTbl.Set("AceEvent-3.0", DynValue.NewTable(aceEvent!)); } catch { }
 
                     // AceTimer: ScheduleTimer(object, funcOrName, delaySeconds) -> timerId; CancelTimer(object, timerId)
                     var aceTimer = new Table(_script);
                     aceTimer.Set("ScheduleTimer", DynValue.NewCallback((ctx2, a2) =>
                     {
                         // support both obj:ScheduleTimer(func, delay) (self, func, delay) and ScheduleTimer(obj, func, delay)
-                        Table objTable = null;
-                        DynValue funcVal = null;
+                        Table? objTable = null;
+                        DynValue? funcVal = null;
                         double delay = 0;
                         if (a2.Count >= 3 && a2[0].Type == DataType.Table)
                         {
@@ -2223,6 +2761,7 @@ namespace Flux
                         }
 
                         var timer = new System.Timers.Timer(delay * 1000.0) { AutoReset = false };
+                        try { EmitOutput($"[LuaRunner-Diag] Schedule AceTimer id={id} addon='{addonName}' delay={delay}s"); } catch { }
                         timer.Elapsed += (s, e) =>
                         {
                             try
@@ -2237,6 +2776,8 @@ namespace Flux
                                 {
                                     try
                                     {
+                                        var seq = System.Threading.Interlocked.Increment(ref _execSequence);
+                                        EmitOutput($"[LuaRunner-Diag] Seq={seq} AceTimer id={id} addon='{addonName}' firing (delay={delay}s)");
                                         if (funcVal.Type == DataType.Function)
                                         {
                                             _script.Call(funcVal.Function, objTable != null ? DynValue.NewTable(objTable) : DynValue.Nil);
@@ -2278,6 +2819,7 @@ namespace Flux
                                 {
                                     try { t.Stop(); t.Dispose(); } catch { }
                                     map.Remove(id);
+                                    try { var seq = System.Threading.Interlocked.Increment(ref _execSequence); EmitOutput($"[LuaRunner-Diag] Seq={seq} AceTimer CancelTimer id={id} addon='{addonName}'"); } catch { }
                                 }
                             }
                         }
@@ -2309,7 +2851,7 @@ namespace Flux
                             {
                                 if (_libRegistry.TryGetValue(cname, out var tbl) && tbl != null)
                                 {
-                                    try { libsTbl.Set(cname, DynValue.NewTable(tbl)); } catch { }
+                                    try { EnsureTableHasFallback(tbl); libsTbl.Set(cname, DynValue.NewTable(tbl)); } catch { }
                                 }
                             }
                         }
@@ -2394,7 +2936,11 @@ namespace Flux
                                         {
                                             foreach (var fn in list)
                                             {
-                                                try { _script.Call(fn); } catch { }
+                                                try {
+                                                    var seq = System.Threading.Interlocked.Increment(ref _execSequence);
+                                                    EmitOutput($"[LuaRunner-Diag] Seq={seq} LibDataBroker.Fire event='{ev}'");
+                                                    _script.Call(fn);
+                                                } catch (Exception ex) { EmitOutput("[LuaRunner-Diag] LibDataBroker.Fire callback error: " + ex.Message); }
                                             }
                                         }
                                     }
@@ -2516,12 +3062,38 @@ namespace Flux
         {
             try
             {
-            // Load the chunk and call it with (addonName, namespaceTable) like WoW does (local name, ns = ...)
-            // Provide a chunk name (filePath) so runtime errors include the source filename/line numbers
-            var chunkName = filePath ?? (isLibraryFile ? $"@{addonName}:{firstVarArg ?? "lib"}" : $"@{addonName}:chunk");
-            var func = _script.LoadString(code, null, chunkName);
-                Table ns;
-                if (!_addonNamespaces.TryGetValue(addonName, out ns))
+                        // Load the chunk and call it with (addonName, namespaceTable) like WoW does (local name, ns = ...)
+                        // Provide a chunk name (filePath) so runtime errors include the source filename/line numbers
+                        // If this is the Attune addon, inject an in-chunk diagnostic prefix so the instrumentation
+                        // executes in the same chunk context (without editing addon files).
+                        if ((filePath != null && filePath.IndexOf("Attune\\Attune.lua", StringComparison.OrdinalIgnoreCase) >= 0) || string.Equals(addonName, "Attune", StringComparison.OrdinalIgnoreCase))
+                        {
+                                try
+                                {
+                                        var dbgPrefix = @"-- INJECTED IN-CHUNK DIAGNOSTICS (auto)
+do
+    local lib = LibStub('AceAddon-3.0')
+    if lib == nil then
+        print('[LuaRunner-Diag] IN-CHUNK: LibStub returned nil for AceAddon')
+    else
+        print('[LuaRunner-Diag] IN-CHUNK: LibStub type='..type(lib)..' NewAddon type='..(lib.NewAddon and type(lib.NewAddon) or 'nil')..' NewAddon tostring='..tostring(lib.NewAddon))
+        local ok1, r1 = pcall(function() if lib and lib.NewAddon then return lib:NewAddon('Attune','AceConsole-3.0') end end)
+        print('[LuaRunner-Diag] IN-CHUNK: pcall colon ok='..tostring(ok1)..' type='..(type(r1)))
+        local fn = lib and lib.NewAddon
+        local ok2, r2 = pcall(function() if fn then return fn(lib,'Attune','AceConsole-3.0') end end)
+        print('[LuaRunner-Diag] IN-CHUNK: pcall dot ok='..tostring(ok2)..' type='..(type(r2)))
+    end
+    if debug and debug.traceback then print(debug.traceback()) end
+end
+";
+                                        code = dbgPrefix + "\n" + code;
+                                }
+                                catch { }
+                        }
+                        var chunkName = filePath ?? (isLibraryFile ? $"@{addonName}:{firstVarArg ?? "lib"}" : $"@{addonName}:chunk");
+                        var func = _script.LoadString(code, null, chunkName);
+                Table? ns = null;
+                if (!_addonNamespaces.TryGetValue(addonName, out ns) || ns == null)
                 {
                     ns = new Table(_script);
                     _addonNamespaces[addonName] = ns;
@@ -2534,7 +3106,10 @@ namespace Flux
                 {
                     var cf = _script.Globals.Get("CreateFrame");
                     var ls = _script.Globals.Get("LibStub");
-                    EmitOutput($"[LuaRunner-Diag] About to execute chunk='{chunkName}' CreateFrameType={cf?.Type} LibStubType={ls?.Type}");
+                    var seq = System.Threading.Interlocked.Increment(ref _execSequence);
+                    string callerMethod = "(unknown)";
+                    try { var f = new System.Diagnostics.StackTrace(1, false).GetFrame(0); if (f != null && f.GetMethod() != null) callerMethod = f.GetMethod()!.Name; } catch { }
+                    EmitOutput($"[LuaRunner-Diag] Seq={seq} Caller={callerMethod} About to execute chunk='{chunkName}' CreateFrameType={cf?.Type} LibStubType={ls?.Type}");
                 }
                 catch { }
 
@@ -2545,8 +3120,52 @@ namespace Flux
                     {
                         try
                         {
-                            var dbgChunk = @"local a = LibStub('AceAddon-3.0'); if a==nil then print('[LuaRunner-Diag] Pre-Attune: LibStub returned nil for AceAddon') else print('[LuaRunner-Diag] Pre-Attune: LibStub AceAddon object type='..type(a)..' NewAddon type='..(a.NewAddon and type(a.NewAddon) or 'nil')) end
-local loc = LibStub('AceLocale-3.0'); if loc==nil then print('[LuaRunner-Diag] Pre-Attune: AceLocale returned nil') else print('[LuaRunner-Diag] Pre-Attune: AceLocale type='..type(loc)..' GetLocale type='..(loc.GetLocale and type(loc.GetLocale) or 'nil')); if type(loc.GetLocale)=='function' then local L = loc:GetLocale('Attune'); print('[LuaRunner-Diag] Pre-Attune: AceLocale:GetLocale returned type='..type(L)) else print('[LuaRunner-Diag] Pre-Attune: AceLocale:GetLocale missing') end end";
+                                                        var dbgChunk = @"local a = LibStub('AceAddon-3.0');
+if a==nil then
+    print('[LuaRunner-Diag] Pre-Attune: LibStub returned nil for AceAddon')
+else
+    print('[LuaRunner-Diag] Pre-Attune: LibStub AceAddon object type='..type(a)..' NewAddon type='..(a.NewAddon and type(a.NewAddon) or 'nil'))
+    -- enumerate keys on the lib table
+    for k,v in pairs(a) do
+        local kt = type(k)
+        local vt = type(v)
+        print('[LuaRunner-Diag] Pre-Attune: AceAddon key='..tostring(k)..' keyType='..kt..' valType='..vt)
+    end
+    -- inspect metatable and __index
+    local mt = getmetatable(a)
+    if mt then
+        print('[LuaRunner-Diag] Pre-Attune: AceAddon has metatable')
+        if type(mt.__index)=='table' then
+            for kk,vv in pairs(mt.__index) do
+                print('[LuaRunner-Diag] Pre-Attune: metatable.__index key='..tostring(kk)..' valType='..type(vv))
+            end
+        else
+            print('[LuaRunner-Diag] Pre-Attune: metatable.__index type='..type(mt.__index))
+        end
+    else
+        print('[LuaRunner-Diag] Pre-Attune: AceAddon has no metatable')
+    end
+-- Try a safe pcall of the NewAddon invocation to observe whether calling it directly succeeds
+local success, result = pcall(function()
+    local lib = LibStub('AceAddon-3.0')
+    if lib and lib.NewAddon then
+        return lib:NewAddon('Attune', 'AceConsole-3.0')
+    end
+    return nil
+end)
+print('[LuaRunner-Diag] Pre-Attune: NewAddon pcall ok='..tostring(success)..' resultType='..(type(result)))
+end
+local loc = LibStub('AceLocale-3.0');
+if loc==nil then
+    print('[LuaRunner-Diag] Pre-Attune: AceLocale returned nil')
+else
+    print('[LuaRunner-Diag] Pre-Attune: AceLocale type='..type(loc)..' GetLocale type='..(loc.GetLocale and type(loc.GetLocale) or 'nil'))
+    if type(loc.GetLocale)=='function' then
+        local L = loc:GetLocale('Attune'); print('[LuaRunner-Diag] Pre-Attune: AceLocale:GetLocale returned type='..type(L))
+    else
+        print('[LuaRunner-Diag] Pre-Attune: AceLocale:GetLocale missing')
+    end
+end";
                             _script.DoString(dbgChunk);
                         }
                         catch { }
@@ -2554,21 +3173,156 @@ local loc = LibStub('AceLocale-3.0'); if loc==nil then print('[LuaRunner-Diag] P
                 }
                 catch { }
 
-                if (isLibraryFile)
+                // Defensive runtime injection: ensure AceAddon-3.0 table has a callable NewAddon
+                try
                 {
-                    // Libraries expect (MAJOR, MINOR)
-                    _script.Call(func, DynValue.NewString(firstArg), DynValue.NewNumber(libraryMinor));
+                    var libStubDv = _script.Globals.Get("LibStub");
+                    if (libStubDv != null && libStubDv.Type != DataType.Nil)
+                    {
+                        try
+                        {
+                            var aceDv = _script.Call(libStubDv, DynValue.NewString("AceAddon-3.0"));
+                            if (aceDv != null && aceDv.Type == DataType.Table)
+                            {
+                                var maybeNew = aceDv.Table.Get("NewAddon");
+                                if ((maybeNew == null || maybeNew.Type == DataType.Nil) && _preregisteredAceAddonNewAddon != null && _preregisteredAceAddonNewAddon.Type != DataType.Nil)
+                                {
+                                    aceDv.Table.Set("NewAddon", _preregisteredAceAddonNewAddon);
+                                    try
+                                    {
+                                        var mt = aceDv.Table.MetaTable ?? new Table(_script);
+                                        var idx = mt.Get("__index");
+                                        if (idx == null || idx.IsNil())
+                                        {
+                                            var idt = new Table(_script);
+                                            idt.Set("NewAddon", _preregisteredAceAddonNewAddon);
+                                            mt.Set("__index", DynValue.NewTable(idt));
+                                        }
+                                        else if (idx.Type == DataType.Table)
+                                        {
+                                            idx.Table.Set("NewAddon", _preregisteredAceAddonNewAddon);
+                                        }
+                                        aceDv.Table.MetaTable = mt;
+                                    }
+                                    catch { }
+                                    EmitOutput("[LuaRunner-Diag] Injected preserved NewAddon into AceAddon table before executing addon chunk");
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+
+                // If an addon namespace entry already exists from a previous attempt,
+                // remove it only once per overall addon load. Repeated removal during a
+                // multi-file load can trigger libraries/addon code to reinitialize the
+                // addon multiple times (observed as repeated Attune loads).
+                try
+                {
+                    if (!string.IsNullOrEmpty(addonName) && _aceAddons.ContainsKey(addonName) && !_clearedAddons.Contains(addonName))
+                    {
+                        _aceAddons.Remove(addonName);
+                        _clearedAddons.Add(addonName);
+                        EmitOutput($"[LuaRunner-Diag] Removed preexisting _aceAddons['{addonName}'] to allow NewAddon to create a fresh addon table (one-time)");
+                    }
+                }
+                catch { }
+
+                // Normalize chunk identity for deduplication (absolute path for files,
+                // lowercase canonical for generated/library chunks) so the run-once guard
+                // is robust to different chunk-name forms (relative vs absolute).
+                string canonicalChunkKey;
+                try
+                {
+                    if (!string.IsNullOrEmpty(filePath))
+                    {
+                        canonicalChunkKey = System.IO.Path.GetFullPath(filePath).ToLowerInvariant();
+                    }
+                    else
+                    {
+                        canonicalChunkKey = (chunkName ?? string.Empty).ToLowerInvariant();
+                    }
+                }
+                catch
+                {
+                    canonicalChunkKey = (chunkName ?? string.Empty).ToLowerInvariant();
+                }
+
+                // If we've been asked to stop, avoid executing further chunks
+                if (_stopping)
+                {
+                    EmitOutput($"[LuaRunner] Skipping execution of '{chunkName}' because Stop was requested");
+                }
+                else if (_executedChunks.Contains(canonicalChunkKey))
+                {
+                    EmitOutput($"[LuaRunner-Diag] Skipping already-executed chunk='{chunkName}' canonical='{canonicalChunkKey}'");
                 }
                 else
                 {
-                    // Addon files expect (addonName, namespaceTable)
-                    _script.Call(func, DynValue.NewString(addonName), DynValue.NewTable(ns));
+                    // Safety: if this is the Attune addon and the addon-local
+                    // localization table was not created by AceLocale, provide a
+                    // minimal fallback so indexing (e.g. AttuneLang["Version"])
+                    // does not raise a nil-index error during startup.
+                    try
+                    {
+                        if (!string.IsNullOrEmpty(addonName) && string.Equals(addonName, "Attune", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var existingAttuneLang = _script.Globals.Get("AttuneLang");
+                            if (existingAttuneLang == null || existingAttuneLang.IsNil())
+                            {
+                                var fb = new Table(_script);
+                                var mtfb = new Table(_script);
+                                mtfb.Set("__index", DynValue.NewCallback((c2, a2) =>
+                                {
+                                    if (a2.Count >= 2 && a2[1].Type == DataType.String) return DynValue.NewString(a2[1].String);
+                                    return DynValue.NewString(string.Empty);
+                                }));
+                                fb.MetaTable = mtfb;
+                                _script.Globals.Set("AttuneLang", DynValue.NewTable(fb));
+                                EmitOutput("[LuaRunner-Diag] Pre-injected fallback AttuneLang to avoid nil indexing");
+                            }
+                        }
+                    }
+                    catch { }
+                    if (isLibraryFile)
+                    {
+                        // Libraries expect (MAJOR, MINOR)
+                        _script.Call(func, DynValue.NewString(firstArg), DynValue.NewNumber(libraryMinor));
+                    }
+                    else
+                    {
+                        // Addon files expect (addonName, namespaceTable)
+                        _script.Call(func, DynValue.NewString(addonName), DynValue.NewTable(ns));
+                    }
+                    // Record the canonicalized key so future attempts to run the same
+                    // physical file or logical chunk are deduplicated.
+                    _executedChunks.Add(canonicalChunkKey);
+                    try
+                    {
+                        var baseName = System.IO.Path.GetFileName(canonicalChunkKey) ?? string.Empty;
+                        if (!string.IsNullOrEmpty(baseName) && baseName.Equals(addonName + ".lua", StringComparison.OrdinalIgnoreCase))
+                        {
+                            EmitOutput($"[Lua] Script {addonName} main executed. canonical='{canonicalChunkKey}'");
+                        }
+                        else
+                        {
+                            EmitOutput($"[LuaRunner-Diag] Executed chunk canonical='{canonicalChunkKey}' for addon='{addonName}'");
+                        }
+                    }
+                    catch { EmitOutput($"[LuaRunner-Diag] Executed chunk for addon='{addonName}' (canonical unknown)"); }
                 }
-                EmitOutput($"[Lua] Script {addonName} executed.");
             }
             catch (ScriptRuntimeException ex)
             {
                 EmitOutput("[Lua runtime error] " + ex.DecoratedMessage);
+                try
+                {
+                    // Emit a lightweight snapshot of suspicious globals and registries
+                    var snap = EmitRuntimeSnapshot("RunScriptFromString", ex);
+                    if (!string.IsNullOrEmpty(snap)) EmitOutput(snap);
+                }
+                catch { }
             }
             catch (Exception ex)
             {
@@ -2723,7 +3477,10 @@ local loc = LibStub('AceLocale-3.0'); if loc==nil then print('[LuaRunner-Diag] P
                             EmitOutput($"[LuaRunner] TriggerEvent {eventName} skipping null handler");
                             continue;
                         }
-                        try { EmitOutput($"[LuaRunner] TriggerEvent invoking handler for {eventName} (closure={h.GetHashCode()})"); } catch { }
+                        try {
+                            var seq = System.Threading.Interlocked.Increment(ref _execSequence);
+                            EmitOutput($"[LuaRunner] Seq={seq} TriggerEvent invoking handler for {eventName} (closure={h.GetHashCode()})");
+                        } catch { }
                         _script.Call(h, dynArgs.ToArray());
                     }
                     catch (Exception ex)
@@ -2745,9 +3502,14 @@ local loc = LibStub('AceLocale-3.0'); if loc==nil then print('[LuaRunner-Diag] P
                     var member = addonTbl.Get(hookName);
                     if (member != null && member.Type == DataType.Function)
                     {
+                        try
+                        {
+                            var seq = System.Threading.Interlocked.Increment(ref _execSequence);
+                            EmitOutput($"[LuaRunner] Seq={seq} Called {hookName} on addon {kv.Key}");
+                        }
+                        catch { }
                         // call with addon table as first arg
                         _script.Call(member.Function, DynValue.NewTable(addonTbl));
-                        EmitOutput($"[LuaRunner] Called {hookName} on addon {kv.Key}");
                     }
                 }
                 catch (Exception ex)
@@ -2773,6 +3535,7 @@ local loc = LibStub('AceLocale-3.0'); if loc==nil then print('[LuaRunner-Diag] P
         public Dictionary<string, object?> GetSavedVariablesAsObject()
         {
             var result = new Dictionary<string, object?>();
+            if (_savedVarsTable == null) return result;
             foreach (var pair in _savedVarsTable.Pairs)
             {
                 var key = pair.Key.String;

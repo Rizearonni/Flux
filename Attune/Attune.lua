@@ -15,6 +15,16 @@
 -- ADDON VARIABLES
 -------------------------------------------------------------------------
 
+print("[LuaRunner-Diag] ATTEMPT: Inspecting LibStub and AceAddon just before NewAddon")
+print("[LuaRunner-Diag] LibStub type:", type(LibStub))
+local __ls_mt = getmetatable(LibStub)
+print("[LuaRunner-Diag] LibStub metatable:", tostring(__ls_mt))
+print("[LuaRunner-Diag] LibStub.__call type:", type(__ls_mt and __ls_mt.__call))
+local __ace = nil
+local okAce, aceErr = pcall(function() __ace = LibStub and LibStub("AceAddon-3.0") end)
+print("[LuaRunner-Diag] LibStub('AceAddon-3.0') pcall ok:", okAce, "ace type:", type(__ace), "ace tostring:", tostring(__ace))
+print("[LuaRunner-Diag] ace.NewAddon type:", type(__ace and __ace.NewAddon), tostring(__ace and __ace.NewAddon))
+print("[LuaRunner-Diag] Now performing the original NewAddon assignment (may return nil if already registered)")
 Attune = LibStub("AceAddon-3.0"):NewAddon("Attune", "AceConsole-3.0", "AceEvent-3.0", "AceComm-3.0")
 Attune_Data = {};							-- Attunements / steps / tooltips
 

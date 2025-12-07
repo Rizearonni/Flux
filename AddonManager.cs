@@ -472,5 +472,18 @@ end
                 try { runner.TriggerEvent(eventName, args); } catch { }
             }
         }
+
+        // Stop and dispose all active runners (cooperative shutdown)
+        public void StopAll()
+        {
+            foreach (var kv in _runners)
+            {
+                try
+                {
+                    kv.Value.Stop();
+                }
+                catch { }
+            }
+        }
     }
 }

@@ -33,6 +33,7 @@ namespace Flux
             }
 
             _addonManager = new AddonManager(_frameManager);
+            this.Closed += MainWindow_Closed;
 
             // Wire buttons null-safely (explicit checks to avoid preview language features)
             var inspectorApplyBtn = this.FindControl<Button>("InspectorApply");
@@ -401,6 +402,19 @@ namespace Flux
             AppendToConsole("[Toolbar] Stop clicked");
         }
 
+        private void MainWindow_Closed(object? sender, EventArgs e)
+        {
+            AppendToConsole("[MainWindow] Closed — stopping addons and runner tasks");
+            try
+            {
+                _addonManager?.StopAll();
+            }
+            catch (Exception ex)
+            {
+                AppendToConsole("[MainWindow] Error stopping addons: " + ex.Message);
+            }
+        }
+
         private void ReloadButton_Click(object? sender, RoutedEventArgs e)
         {
             AppendToConsole("[Toolbar] Reload clicked — reloading addons");
@@ -498,13 +512,13 @@ namespace Flux
                             catch { options = null; }
 
                             // If we couldn't create options or invocation fails, try passing null (some implementations accept null)
-                            try
-                            {
-                                taskObj = chosen.Invoke(storageProvider, new object[] { options });
+                                try
+                                {
+                                taskObj = chosen.Invoke(storageProvider, new object[] { options! });
                             }
                             catch (TargetInvocationException)
                             {
-                                try { taskObj = chosen.Invoke(storageProvider, new object[] { null }); } catch { taskObj = null; }
+                                try { taskObj = chosen.Invoke(storageProvider, new object[] { null! }); } catch { taskObj = null; }
                             }
                         }
 
