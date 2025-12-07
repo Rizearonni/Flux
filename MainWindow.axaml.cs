@@ -90,7 +90,8 @@ namespace Flux
 
         private void LoadAddonButton_Click(object? sender, RoutedEventArgs e)
         {
-            AppendToConsole("[Info] Load addon - feature not implemented yet.");
+            // Reuse the Open button logic to select and load an addon folder
+            OpenButton_Click(sender, e);
         }
 
         private void OpenSampleButton_Click(object? sender, RoutedEventArgs e)
@@ -582,6 +583,103 @@ namespace Flux
                 {
                     try { var u = new Uri(path); if (Directory.Exists(u.LocalPath)) return u.LocalPath; } catch { }
                 }
+
+                // If the input is a short name (no separators), try to locate a matching folder
+                try
+                {
+                    if (!path.Contains(Path.DirectorySeparatorChar) && !path.Contains(Path.AltDirectorySeparatorChar))
+                    {
+                        // Search common roots: sample_addons, app base, and parent folders
+                        var candidates = new List<string>();
+                        var baseDir = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", ".."));
+                        candidates.Add(Path.Combine(baseDir, "sample_addons"));
+                        candidates.Add(baseDir);
+                        candidates.Add(AppDomain.CurrentDomain.BaseDirectory);
+
+                        foreach (var root in candidates)
+                        {
+                            try
+                            {
+                                if (!Directory.Exists(root)) continue;
+                                // Try direct child first
+                                var direct = Path.Combine(root, path);
+                                if (Directory.Exists(direct)) return direct;
+
+                                // Then try a shallow recursive search (limit depth via Enumerate with SearchOption.TopDirectoryOnly then AllDirectories)
+                                // Use AllDirectories but guard with try/catch for IO errors
+                                foreach (var dir in Directory.EnumerateDirectories(root, path, SearchOption.AllDirectories))
+                                {
+                                    if (Directory.Exists(dir)) return dir;
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+
+                // As a last resort, search common World of Warcraft AddOns locations on Windows
+                try
+                {
+                    var extraRoots = new List<string>();
+                    try
+                    {
+                        var roam = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                        if (!string.IsNullOrEmpty(roam)) extraRoots.Add(roam);
+                    }
+                    catch { }
+                    try
+                    {
+                        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                        if (!string.IsNullOrEmpty(local)) extraRoots.Add(local);
+                    }
+                    catch { }
+                    try
+                    {
+                        var pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+                        if (!string.IsNullOrEmpty(pf)) extraRoots.Add(pf);
+                    }
+                    catch { }
+                    try
+                    {
+                        var pf86 = Environment.GetEnvironmentVariable("ProgramFiles(x86)") ?? string.Empty;
+                        if (!string.IsNullOrEmpty(pf86)) extraRoots.Add(pf86);
+                    }
+                    catch { }
+
+                    foreach (var r in extraRoots)
+                    {
+                        try
+                        {
+                            if (string.IsNullOrEmpty(r) || !Directory.Exists(r)) continue;
+                            // Common WoW layout: <root>\World of Warcraft\_retail_\Interface\AddOns
+                            var tryPaths = new[] {
+                                Path.Combine(r, "World of Warcraft", "_retail_", "Interface", "AddOns"),
+                                Path.Combine(r, "World of Warcraft", "Interface", "AddOns"),
+                                Path.Combine(r, "World of Warcraft", "_classic_", "Interface", "AddOns")
+                            };
+                            foreach (var tp in tryPaths)
+                            {
+                                if (!Directory.Exists(tp)) continue;
+                                // direct child
+                                var direct = Path.Combine(tp, path);
+                                if (Directory.Exists(direct)) return direct;
+
+                                // shallow recursive search limited by wildcard enumeration
+                                try
+                                {
+                                    foreach (var dir in Directory.EnumerateDirectories(tp, path, SearchOption.AllDirectories))
+                                    {
+                                        if (Directory.Exists(dir)) return dir;
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
 
                 return null;
             }
