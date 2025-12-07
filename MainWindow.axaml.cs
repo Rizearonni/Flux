@@ -420,16 +420,90 @@ namespace Flux
                                     foreach (var item in enumRes)
                                     {
                                         string? path = null;
-                                        var pathProp = item.GetType().GetProperty("Path") ?? item.GetType().GetProperty("FullPath") ?? item.GetType().GetProperty("LocalPath");
+                                        var itemType = item.GetType();
+                                        var pathProp = itemType.GetProperty("Path") ?? itemType.GetProperty("FullPath") ?? itemType.GetProperty("LocalPath");
                                         if (pathProp != null)
                                         {
-                                            path = pathProp.GetValue(item) as string;
+                                            try { path = pathProp.GetValue(item) as string; } catch { path = null; }
                                         }
+
+                                        // If that didn't yield a usable path, try other string properties (public/private)
+                                        if (string.IsNullOrEmpty(path))
+                                        {
+                                            try
+                                            {
+                                                foreach (var pinfo in itemType.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
+                                                {
+                                                    if (pinfo.PropertyType == typeof(string))
+                                                    {
+                                                        try
+                                                        {
+                                                            var val = pinfo.GetValue(item) as string;
+                                                            if (!string.IsNullOrEmpty(val))
+                                                            {
+                                                                path = val;
+                                                                break;
+                                                            }
+                                                        }
+                                                        catch { }
+                                                    }
+                                                }
+                                            }
+                                            catch { }
+                                        }
+
+                                        // If still no path, try string fields
+                                        if (string.IsNullOrEmpty(path))
+                                        {
+                                            try
+                                            {
+                                                foreach (var finfo in itemType.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
+                                                {
+                                                    if (finfo.FieldType == typeof(string))
+                                                    {
+                                                        try
+                                                        {
+                                                            var val = finfo.GetValue(item) as string;
+                                                            if (!string.IsNullOrEmpty(val))
+                                                            {
+                                                                path = val;
+                                                                break;
+                                                            }
+                                                        }
+                                                        catch { }
+                                                    }
+                                                }
+                                            }
+                                            catch { }
+                                        }
+
+                                        // Final fallback to ToString()
                                         if (string.IsNullOrEmpty(path)) path = item?.ToString();
+
+                                        // Normalize file:// URIs if present
+                                        if (!string.IsNullOrEmpty(path) && path.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            try
+                                            {
+                                                var u = new Uri(path);
+                                                path = u.LocalPath;
+                                            }
+                                            catch { }
+                                        }
                                         if (!string.IsNullOrEmpty(path))
                                         {
-                                            AppendToConsole($"[Toolbar] Selected: {path}");
-                                            _addonManager?.LoadAddonFromFolder(path, LuaRunner_OnOutput);
+                                            // Try to resolve the selected path to a usable filesystem path
+                                            var resolved = ResolveSelectedPath(path);
+                                            if (!string.IsNullOrEmpty(resolved))
+                                            {
+                                                AppendToConsole($"[Toolbar] Selected: {resolved}");
+                                                _addonManager?.LoadAddonFromFolder(resolved, LuaRunner_OnOutput);
+                                            }
+                                            else
+                                            {
+                                                AppendToConsole($"[Toolbar] Selected (unresolved): {path}");
+                                                _addonManager?.LoadAddonFromFolder(path, LuaRunner_OnOutput);
+                                            }
                                             handled = true;
                                             break;
                                         }
@@ -449,8 +523,17 @@ namespace Flux
 #pragma warning restore CS0618
                     if (!string.IsNullOrEmpty(path))
                     {
-                        AppendToConsole($"[Toolbar] Selected: {path}");
-                        _addonManager?.LoadAddonFromFolder(path, LuaRunner_OnOutput);
+                        var resolved = ResolveSelectedPath(path);
+                        if (!string.IsNullOrEmpty(resolved))
+                        {
+                            AppendToConsole($"[Toolbar] Selected: {resolved}");
+                            _addonManager?.LoadAddonFromFolder(resolved, LuaRunner_OnOutput);
+                        }
+                        else
+                        {
+                            AppendToConsole($"[Toolbar] Selected: {path}");
+                            _addonManager?.LoadAddonFromFolder(path, LuaRunner_OnOutput);
+                        }
                     }
                     else
                     {
@@ -467,6 +550,42 @@ namespace Flux
         private void SettingsButton_Click(object? sender, RoutedEventArgs e)
         {
             AppendToConsole("[Toolbar] Settings clicked — (not implemented)");
+        }
+
+        private string? ResolveSelectedPath(string path)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(path)) return null;
+
+                // If already rooted and exists, return full path
+                if (Path.IsPathRooted(path) && Directory.Exists(path))
+                    return Path.GetFullPath(path);
+
+                // Try relative to the app base (three levels up, matching sample_addons layout)
+                var candidate = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", path));
+                if (Directory.Exists(candidate)) return candidate;
+
+                // Try relative to base directly
+                candidate = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, path));
+                if (Directory.Exists(candidate)) return candidate;
+
+                // Special-case known short names
+                if (string.Equals(path, "sample_addons", StringComparison.OrdinalIgnoreCase))
+                {
+                    var sample = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "sample_addons"));
+                    if (Directory.Exists(sample)) return sample;
+                }
+
+                // If it looks like a file:// URI, try to normalize
+                if (path.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+                {
+                    try { var u = new Uri(path); if (Directory.Exists(u.LocalPath)) return u.LocalPath; } catch { }
+                }
+
+                return null;
+            }
+            catch { return null; }
         }
     }
 }
