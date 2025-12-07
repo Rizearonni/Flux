@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using MoonSharp.Interpreter;
 using MoonSharp.Interpreter.Interop;
 using System.Text.Json;
+using System.Timers;
+using Avalonia.Threading;
 using Avalonia.Media.Imaging;
 using Avalonia.Media;
 using Avalonia;
@@ -12,6 +14,11 @@ namespace Flux
     public class LuaRunner
     {
         private Script _script;
+        private readonly Dictionary<string, Table> _libRegistry = new();
+        private readonly Dictionary<string, Dictionary<string, Closure>> _aceRegisteredHandlers = new();
+        private readonly Dictionary<string, Table> _aceAddons = new();
+        private readonly Dictionary<string, Dictionary<int, System.Timers.Timer>> _aceTimers = new();
+        private int _nextTimerId = 1;
         private Dictionary<string, List<Closure>> _eventHandlers = new();
         private Table _savedVarsTable;
         public string AddonName { get; }
@@ -45,6 +52,9 @@ namespace Flux
 
             // Create saved variables table with metatable to detect writes
             InitializeSavedVariablesTable(null);
+
+            // Initialize a minimal LibStub implementation so embedded libs (Ace3) can register
+            InitializeLibStub();
 
             // Provide a safe 'print' function
             _script.Globals["print"] = DynValue.NewCallback((ctx, args) =>
@@ -413,6 +423,347 @@ namespace Flux
             _script.Globals["WoW"] = DynValue.NewTable(wowTable);
         }
 
+        private void InitializeLibStub()
+        {
+            try
+            {
+                var libStub = new Table(_script);
+
+                // __call metamethod: LibStub("Name") -> returns library table or nil
+                var mt = new Table(_script);
+                mt.Set("__call", DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 1 && args[0].Type == DataType.String)
+                    {
+                        var name = args[0].String;
+                        if (_libRegistry.TryGetValue(name, out var t)) return DynValue.NewTable(t);
+                    }
+                    return DynValue.Nil;
+                }));
+
+                // LibStub:NewLibrary(name, minor)
+                libStub.Set("NewLibrary", DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 1 && args[0].Type == DataType.String)
+                    {
+                        var name = args[0].String;
+                        int minor = 0;
+                        if (args.Count >= 2 && args[1].Type == DataType.Number) minor = (int)args[1].Number;
+
+                        if (_libRegistry.TryGetValue(name, out var existing))
+                        {
+                            // If existing minor is >= requested, do nothing
+                            var exMinorDyn = existing.Get("__minor");
+                            if (exMinorDyn != null && exMinorDyn.Type == DataType.Number && (int)exMinorDyn.Number >= minor)
+                            {
+                                return DynValue.Nil;
+                            }
+                        }
+
+                        var t = new Table(_script);
+                        t.Set("__name", DynValue.NewString(name));
+                        t.Set("__minor", DynValue.NewNumber(minor));
+                        _libRegistry[name] = t;
+                        return DynValue.NewTable(t);
+                    }
+                    return DynValue.Nil;
+                }));
+
+                // LibStub:GetLibrary(name, silent)
+                libStub.Set("GetLibrary", DynValue.NewCallback((ctx, args) =>
+                {
+                    if (args.Count >= 1 && args[0].Type == DataType.String)
+                    {
+                        var name = args[0].String;
+                        if (_libRegistry.TryGetValue(name, out var t)) return DynValue.NewTable(t);
+                    }
+                    return DynValue.Nil;
+                }));
+
+                libStub.MetaTable = mt;
+                _script.Globals["LibStub"] = DynValue.NewTable(libStub);
+
+                // Pre-register a minimal AceAddon-3.0 implementation
+                try
+                {
+                    var ace = new Table(_script);
+                    ace.Set("NewAddon", DynValue.NewCallback((ctx, args) =>
+                    {
+                        // Args: name [, ...mixins]
+                        if (args.Count >= 1 && args[0].Type == DataType.String)
+                        {
+                            var name = args[0].String;
+                            var addonTbl = new Table(_script);
+                            addonTbl.Set("__name", DynValue.NewString(name));
+
+                            // RegisterEvent method: self:RegisterEvent(event, handler)
+                            addonTbl.Set("RegisterEvent", DynValue.NewCallback((c2, a2) =>
+                            {
+                                if (a2.Count >= 2 && a2[0].Type == DataType.Table && a2[1].Type == DataType.String)
+                                {
+                                    var selfTable = a2[0].Table;
+                                    var ev = a2[1].String;
+
+                                    // Handler can be function or string method name
+                                    DynValue handler = null;
+                                    if (a2.Count >= 3) handler = a2[2];
+
+                                    Closure targetClosure = null;
+
+                                    if (handler != null && handler.Type == DataType.Function)
+                                    {
+                                        targetClosure = handler.Function;
+                                    }
+                                    else if (handler != null && handler.Type == DataType.String)
+                                    {
+                                        var m = selfTable.Get(handler.String);
+                                        if (m != null && (m.Type == DataType.Function || m.Type == DataType.ClrFunction)) targetClosure = m.Function;
+                                    }
+
+                                    // If no explicit handler, look for a method named the event (OnEvent) - skip for now
+
+                                    if (targetClosure != null)
+                                    {
+                                        // Create a wrapper that supplies the addon table as first arg
+                                        var wrapper = DynValue.NewCallback((ctx3, cbArgs) =>
+                                        {
+                                            try
+                                            {
+                                                var argsList = new List<DynValue>();
+                                                argsList.Add(DynValue.NewTable(selfTable));
+                                                if (cbArgs != null)
+                                                {
+                                                    for (int ai = 0; ai < cbArgs.Count; ai++)
+                                                    {
+                                                        argsList.Add(cbArgs[ai]);
+                                                    }
+                                                }
+                                                _script.Call(targetClosure, argsList.ToArray());
+                                            }
+                                            catch { }
+                                            return DynValue.Nil;
+                                        });
+
+                                        // store mapping for unregister
+                                        var addonName = selfTable.Get("__name")?.String ?? name;
+                                        lock (_aceRegisteredHandlers)
+                                        {
+                                            if (!_aceRegisteredHandlers.ContainsKey(addonName)) _aceRegisteredHandlers[addonName] = new Dictionary<string, Closure>();
+                                            _aceRegisteredHandlers[addonName][ev] = wrapper.Function;
+                                        }
+
+                                        if (!_eventHandlers.ContainsKey(ev)) _eventHandlers[ev] = new List<Closure>();
+                                        _eventHandlers[ev].Add(wrapper.Function);
+                                    }
+                                }
+                                return DynValue.Nil;
+                            }));
+
+                            // UnregisterEvent
+                            addonTbl.Set("UnregisterEvent", DynValue.NewCallback((c2, a2) =>
+                            {
+                                if (a2.Count >= 2 && a2[0].Type == DataType.Table && a2[1].Type == DataType.String)
+                                {
+                                    var selfTable = a2[0].Table;
+                                    var ev = a2[1].String;
+                                    var addonName = selfTable.Get("__name")?.String ?? name;
+                                    lock (_aceRegisteredHandlers)
+                                    {
+                                        if (_aceRegisteredHandlers.TryGetValue(addonName, out var map) && map.TryGetValue(ev, out var closure))
+                                        {
+                                            // remove from global handlers list
+                                            if (_eventHandlers.TryGetValue(ev, out var list))
+                                            {
+                                                list.RemoveAll(c => c == closure);
+                                            }
+                                            map.Remove(ev);
+                                        }
+                                    }
+                                }
+                                return DynValue.Nil;
+                            }));
+
+                            _aceAddons[name] = addonTbl;
+                            return DynValue.NewTable(addonTbl);
+                        }
+                        return DynValue.Nil;
+                    }));
+
+                    // Also register AceEvent-3.0 as a no-op library so mixins resolve
+                    var aceEvent = new Table(_script);
+                    // AceEvent: RegisterEvent(object, eventName, handler) and UnregisterEvent(object, eventName)
+                    aceEvent.Set("RegisterEvent", DynValue.NewCallback((ctx2, a2) =>
+                    {
+                        if (a2.Count >= 3 && a2[0].Type == DataType.Table && a2[1].Type == DataType.String)
+                        {
+                            var objTable = a2[0].Table;
+                            var ev = a2[1].String;
+                            DynValue handler = a2.Count >= 3 ? a2[2] : DynValue.Nil;
+
+                            Closure target = null;
+                            if (handler != null && handler.Type == DataType.Function) target = handler.Function;
+                            else if (handler != null && handler.Type == DataType.String)
+                            {
+                                var m = objTable.Get(handler.String);
+                                if (m != null && (m.Type == DataType.Function || m.Type == DataType.ClrFunction)) target = m.Function;
+                            }
+
+                            if (target != null)
+                            {
+                                var addonName = objTable.Get("__name")?.String ?? "";
+                                var wrapper = DynValue.NewCallback((ctx3, cbArgs) =>
+                                {
+                                    try
+                                    {
+                                        var argsList = new List<DynValue> { DynValue.NewTable(objTable) };
+                                        if (cbArgs != null)
+                                        {
+                                            for (int i = 0; i < cbArgs.Count; i++) argsList.Add(cbArgs[i]);
+                                        }
+                                        _script.Call(target, argsList.ToArray());
+                                    }
+                                    catch { }
+                                    return DynValue.Nil;
+                                });
+
+                                lock (_aceRegisteredHandlers)
+                                {
+                                    if (!_aceRegisteredHandlers.ContainsKey(addonName)) _aceRegisteredHandlers[addonName] = new Dictionary<string, Closure>();
+                                    _aceRegisteredHandlers[addonName][ev] = wrapper.Function;
+                                }
+
+                                if (!_eventHandlers.ContainsKey(ev)) _eventHandlers[ev] = new List<Closure>();
+                                _eventHandlers[ev].Add(wrapper.Function);
+                            }
+                        }
+                        return DynValue.Nil;
+                    }));
+
+                    aceEvent.Set("UnregisterEvent", DynValue.NewCallback((ctx2, a2) =>
+                    {
+                        if (a2.Count >= 2 && a2[0].Type == DataType.Table && a2[1].Type == DataType.String)
+                        {
+                            var objTable = a2[0].Table;
+                            var ev = a2[1].String;
+                            var addonName = objTable.Get("__name")?.String ?? "";
+                            lock (_aceRegisteredHandlers)
+                            {
+                                if (_aceRegisteredHandlers.TryGetValue(addonName, out var map) && map.TryGetValue(ev, out var closure))
+                                {
+                                    if (_eventHandlers.TryGetValue(ev, out var list)) list.RemoveAll(c => c == closure);
+                                    map.Remove(ev);
+                                }
+                            }
+                        }
+                        return DynValue.Nil;
+                    }));
+
+                    _libRegistry["AceEvent-3.0"] = aceEvent;
+
+                    // AceTimer: ScheduleTimer(object, funcOrName, delaySeconds) -> timerId; CancelTimer(object, timerId)
+                    var aceTimer = new Table(_script);
+                    aceTimer.Set("ScheduleTimer", DynValue.NewCallback((ctx2, a2) =>
+                    {
+                        // support both obj:ScheduleTimer(func, delay) (self, func, delay) and ScheduleTimer(obj, func, delay)
+                        Table objTable = null;
+                        DynValue funcVal = null;
+                        double delay = 0;
+                        if (a2.Count >= 3 && a2[0].Type == DataType.Table)
+                        {
+                            objTable = a2[0].Table;
+                            funcVal = a2[1];
+                            delay = a2[2].Number;
+                        }
+                        else if (a2.Count >= 2 && a2[0].Type == DataType.Function)
+                        {
+                            // called as :ScheduleTimer(func, delay) where self is implicit
+                            funcVal = a2[0];
+                            delay = a2[1].Number;
+                        }
+
+                        // no fallback for implicit self; require object table or function provided
+
+                        if (funcVal == null || delay <= 0) return DynValue.Nil;
+
+                        var addonName = objTable?.Get("__name")?.String ?? "";
+                        int id;
+                        lock (_aceTimers)
+                        {
+                            id = _nextTimerId++;
+                            if (!_aceTimers.ContainsKey(addonName)) _aceTimers[addonName] = new Dictionary<int, System.Timers.Timer>();
+                        }
+
+                        var timer = new System.Timers.Timer(delay * 1000.0) { AutoReset = false };
+                        timer.Elapsed += (s, e) =>
+                        {
+                            try
+                            {
+                                timer.Stop();
+                                lock (_aceTimers)
+                                {
+                                    if (_aceTimers.TryGetValue(addonName, out var map)) map.Remove(id);
+                                }
+
+                                Dispatcher.UIThread.Post(() =>
+                                {
+                                    try
+                                    {
+                                        if (funcVal.Type == DataType.Function)
+                                        {
+                                            _script.Call(funcVal.Function, objTable != null ? DynValue.NewTable(objTable) : DynValue.Nil);
+                                        }
+                                        else if (funcVal.Type == DataType.String && objTable != null)
+                                        {
+                                            var m = objTable.Get(funcVal.String);
+                                            if (m != null && m.Type == DataType.Function) _script.Call(m.Function, DynValue.NewTable(objTable));
+                                        }
+                                    }
+                                    catch { }
+                                });
+                            }
+                            catch { }
+                            finally
+                            {
+                                try { timer.Dispose(); } catch { }
+                            }
+                        };
+
+                        lock (_aceTimers)
+                        {
+                            _aceTimers[addonName][id] = timer;
+                        }
+                        timer.Start();
+                        return DynValue.NewNumber(id);
+                    }));
+
+                    aceTimer.Set("CancelTimer", DynValue.NewCallback((ctx2, a2) =>
+                    {
+                        if (a2.Count >= 2 && a2[0].Type == DataType.Table && a2[1].Type == DataType.Number)
+                        {
+                            var objTable = a2[0].Table;
+                            var id = (int)a2[1].Number;
+                            var addonName = objTable.Get("__name")?.String ?? "";
+                            lock (_aceTimers)
+                            {
+                                if (_aceTimers.TryGetValue(addonName, out var map) && map.TryGetValue(id, out var t))
+                                {
+                                    try { t.Stop(); t.Dispose(); } catch { }
+                                    map.Remove(id);
+                                }
+                            }
+                        }
+                        return DynValue.Nil;
+                    }));
+
+                    _libRegistry["AceTimer-3.0"] = aceTimer;
+                    // expose the AceAddon library object
+                    _libRegistry["AceAddon-3.0"] = ace;
+                }
+                catch { }
+            }
+            catch { }
+        }
+
         public void RunScriptFromString(string code, string addonName)
         {
             try
@@ -480,6 +831,29 @@ namespace Flux
                     {
                         EmitOutput("[Event handler error] " + ex.Message);
                     }
+                }
+            }
+        }
+
+        // Invoke lifecycle hooks (OnInitialize, OnEnable) for registered Ace addons
+        public void InvokeAceAddonLifecycle(string hookName)
+        {
+            foreach (var kv in _aceAddons)
+            {
+                var addonTbl = kv.Value;
+                try
+                {
+                    var member = addonTbl.Get(hookName);
+                    if (member != null && member.Type == DataType.Function)
+                    {
+                        // call with addon table as first arg
+                        _script.Call(member.Function, DynValue.NewTable(addonTbl));
+                        EmitOutput($"[LuaRunner] Called {hookName} on addon {kv.Key}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    EmitOutput($"[LuaRunner] Error calling {hookName} on {kv.Key}: {ex.Message}");
                 }
             }
         }

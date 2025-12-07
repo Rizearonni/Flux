@@ -54,6 +54,36 @@ namespace Flux
                 catch { /* ignore errors for prototype */ }
             }
 
+            // Load embedded libraries (common folders: libs, Libs, Lib, Ace3) before running addon files
+            try
+            {
+                var libDirs = new[] { "libs", "Libs", "lib", "Lib", "Libraries", "Ace3" };
+                foreach (var d in Directory.GetDirectories(folderPath))
+                {
+                    var name = Path.GetFileName(d);
+                    if (libDirs.Any(ld => string.Equals(ld, name, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        outputCallback?.Invoke(this, $"[AddonManager] Loading embedded library folder: {name}");
+                        var libFiles = Directory.GetFiles(d, "*.lua", SearchOption.AllDirectories).OrderBy(f => f);
+                        foreach (var lf in libFiles)
+                        {
+                            try
+                            {
+                                var rel = Path.GetRelativePath(folderPath, lf);
+                                outputCallback?.Invoke(this, $"[AddonManager] Loading lib file: {rel}");
+                                var code = File.ReadAllText(lf);
+                                runner.RunScriptFromString(code, addonName);
+                            }
+                            catch (Exception ex)
+                            {
+                                outputCallback?.Invoke(this, $"[AddonManager] Failed to load lib file {lf}: {ex.Message}");
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
             // Determine files to execute. Prefer a .toc file (preserves addon-defined order).
             var filesToRun = new List<string>();
             try
@@ -218,6 +248,18 @@ namespace Flux
                 }
             }
             catch { }
+
+            // Invoke lifecycle hooks for AceAddon-3.0 if any addons were created by the runner
+            try
+            {
+                outputCallback?.Invoke(this, $"[AddonManager] Invoking AceAddon OnInitialize/OnEnable for {addonName}");
+                runner.InvokeAceAddonLifecycle("OnInitialize");
+                runner.InvokeAceAddonLifecycle("OnEnable");
+            }
+            catch (Exception ex)
+            {
+                outputCallback?.Invoke(this, $"[AddonManager] Error invoking lifecycle hooks: {ex.Message}");
+            }
 
             _runners[addonName] = runner;
             return runner;
