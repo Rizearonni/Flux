@@ -218,7 +218,40 @@ namespace Flux
 
                 t.Set("SetBackdrop", DynValue.NewCallback((c, a) =>
                 {
-                    // No-op for prototype. Placeholder for background/texture settings.
+                    // Accept a color name string (e.g., "Red", "LightGray") and apply a Brush
+                    if (vf == null) return DynValue.Nil;
+                    if (a.Count >= 1 && a[0].Type == DataType.String)
+                    {
+                        var colorName = a[0].String;
+                        try
+                        {
+                            // Try to find a Brushes.<Name> property
+                            var brushesType = typeof(Avalonia.Media.Brushes);
+                            var prop = brushesType.GetProperty(colorName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.IgnoreCase);
+                            if (prop != null)
+                            {
+                                var brush = prop.GetValue(null) as Avalonia.Media.IBrush;
+                                if (brush != null)
+                                {
+                                    vf.BackdropBrush = brush;
+                                    _frameManager?.UpdateVisual(vf);
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                    return DynValue.Nil;
+                }));
+
+                // Font size helper
+                t.Set("SetFontSize", DynValue.NewCallback((c, a) =>
+                {
+                    if (vf == null) return DynValue.Nil;
+                    if (a.Count >= 1 && a[0].Type == DataType.Number)
+                    {
+                        vf.FontSize = a[0].Number;
+                        _frameManager?.UpdateVisual(vf);
+                    }
                     return DynValue.Nil;
                 }));
 

@@ -26,6 +26,7 @@ namespace Flux
         public double Opacity { get; set; } = 1.0;
         public string? Text { get; set; }
         public double FontSize { get; set; } = 12.0;
+        public Avalonia.Media.IBrush? BackdropBrush { get; set; }
         public LuaRunner Owner { get; }
 
         public Rectangle Visual { get; set; }
@@ -151,6 +152,15 @@ namespace Flux
                 Canvas.SetTop(vf.Visual, vf.Y);
                 vf.Visual.IsVisible = vf.Visible;
                 vf.Visual.Opacity = vf.Opacity;
+                // Apply backdrop brush if set
+                if (vf.BackdropBrush != null)
+                {
+                    vf.Visual.Fill = vf.BackdropBrush;
+                }
+                else
+                {
+                    vf.Visual.Fill = Brushes.LightGray;
+                }
 
                 // Update text overlay
                 if (vf.VisualText != null)
