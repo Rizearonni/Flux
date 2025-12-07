@@ -1,22 +1,55 @@
--- SimpleHello sample addon for Flux prototype
-print("Flux sample addon: loaded")
+-- SimpleHello sample addon for the Flux prototype
+-- This addon demonstrates registering events, creating a frame and
+-- attaching common scripts (OnClick, OnEnter, OnLeave, OnUpdate),
+-- and using a couple small helper functions exposed by the runtime.
 
--- Demonstrate WoW API stub usage
+local addonName = "SimpleHello"
+print(addonName .. ": loaded")
+
+-- Saved variables example (Flux exposes a SavedVariables table)
+local sv = SavedVariables or {}
+sv.runs = (sv.runs or 0) + 1
+
+-- Register a handler for PLAYER_LOGIN (example of event registration)
 if WoW ~= nil then
   WoW.RegisterEvent("PLAYER_LOGIN", function()
-    print("PLAYER_LOGIN received in addon")
+    print(addonName .. ": PLAYER_LOGIN received (runs=" .. tostring(sv.runs) .. ")")
   end)
 else
-  print("WoW API not available")
+  print(addonName .. ": WoW API not available in this environment")
 end
+
+-- Create a simple visual frame and set it up
 local f = WoW.CreateFrame()
-f:SetSize(200,80)
-f:SetPoint("CENTER", "UIParent", "CENTER", -100, -50) -- anchor form
-f:SetBackdrop("LightGreen")
-f:SetFontSize(18)
-f:Show()
-f:SetScript("OnClick", function() print("Clicked!") end)
-f:SetScript("OnUpdate", function(self, dt) print(string.format("OnUpdate dt=%.3f", dt or 0.0)) end)
-f:SetScript("OnEnter", function() print("OnEnter") end)
-f:SetScript("OnLeave", function() print("OnLeave") end)
-print("Flux sample addon: initialization complete")
+if f ~= nil then
+  f:SetSize(200, 80)
+  -- Place slightly left/above center for visibility
+  f:SetPoint("CENTER", "UIParent", "CENTER", -100, -50)
+  -- Visual helpers added to the runtime: SetBackdrop and SetFontSize
+  f:SetBackdrop("LightGreen")
+  f:SetFontSize(16)
+  f:Show()
+
+  f:SetScript("OnClick", function()
+    print(addonName .. ": frame clicked")
+  end)
+
+  f:SetScript("OnEnter", function()
+    print(addonName .. ": mouse entered frame")
+  end)
+
+  f:SetScript("OnLeave", function()
+    print(addonName .. ": mouse left frame")
+  end)
+
+  f:SetScript("OnUpdate", function(self, dt)
+    -- dt is seconds since last update; keep output light to avoid spam
+    if dt and dt > 0 then
+      -- show a short periodic message (throttled by runtime frequency)
+      -- Commented out by default; uncomment to see continuous updates
+      -- print(string.format("%s: OnUpdate dt=%.3f", addonName, dt))
+    end
+  end)
+end
+
+print(addonName .. ": initialization complete")
