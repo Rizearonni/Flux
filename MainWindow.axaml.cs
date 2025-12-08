@@ -68,6 +68,30 @@ namespace Flux
             }
             var refreshBtn = this.FindControl<Button>("RefreshWorkspaceButton");
             if (refreshBtn != null) refreshBtn.Click += RefreshWorkspaceButton_Click;
+
+            // Dev auto-load: if environment variable FLUX_AUTOLOAD_ADDON is set to a folder,
+            // load it immediately and capture runtime output in the UI console.
+            try
+            {
+                var auto = Environment.GetEnvironmentVariable("FLUX_AUTOLOAD_ADDON");
+                if (!string.IsNullOrEmpty(auto) && Directory.Exists(auto))
+                {
+                    AppendToConsole($"[AutoLoad] Loading addon from: {auto}");
+                    var runner = _addonManager?.LoadAddonFromFolder(auto, LuaRunner_OnOutput);
+                    if (runner != null)
+                    {
+                        _addonManager?.TriggerEvent("PLAYER_LOGIN");
+                        _addonManager?.SaveSavedVariables(runner.AddonName);
+                        PopulateWorkspaceTree(runner);
+                    }
+                    else AppendToConsole("[AutoLoad] Failed to create runner for path.");
+                }
+                else if (!string.IsNullOrEmpty(auto))
+                {
+                    AppendToConsole($"[AutoLoad] Path set but not found: {auto}");
+                }
+            }
+            catch (Exception ex) { AppendToConsole("[AutoLoad] Error: " + ex.Message); }
         }
 
         private void UseRepoLibsButton_Click(object? sender, RoutedEventArgs e)
