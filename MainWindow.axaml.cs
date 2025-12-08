@@ -55,6 +55,8 @@ namespace Flux
             if (reloadBtn != null) reloadBtn.Click += ReloadButton_Click;
             var openBtn = this.FindControl<Button>("OpenButton");
             if (openBtn != null) openBtn.Click += OpenButton_Click;
+            var useRepoBtn = this.FindControl<Button>("UseRepoLibsButton");
+            if (useRepoBtn != null) useRepoBtn.Click += UseRepoLibsButton_Click;
             var settingsBtn = this.FindControl<Button>("SettingsButton");
             if (settingsBtn != null) settingsBtn.Click += SettingsButton_Click;
 
@@ -66,6 +68,23 @@ namespace Flux
             }
             var refreshBtn = this.FindControl<Button>("RefreshWorkspaceButton");
             if (refreshBtn != null) refreshBtn.Click += RefreshWorkspaceButton_Click;
+        }
+
+        private void UseRepoLibsButton_Click(object? sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (_addonManager == null) return;
+                // toggle the manager property, which saves settings and emits change event
+                _addonManager.UseRepoLibs = !_addonManager.UseRepoLibs;
+                var btn = this.FindControl<Button>("UseRepoLibsButton");
+                if (btn != null) btn.Content = _addonManager.UseRepoLibs ? "Libs: Repo" : "Libs: Local";
+                AppendToConsole($"[UI] UseRepoLibs set to: {_addonManager.UseRepoLibs}");
+            }
+            catch (Exception ex)
+            {
+                AppendToConsole($"[UI] UseRepoLibs toggle failed: {ex.Message}");
+            }
         }
 
         private void LoadLogo()

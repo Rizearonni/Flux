@@ -17,6 +17,7 @@
           <Button Name="StopButton" Content="■" Width="36" Height="36" Background="#D32F2F" Foreground="#FFF" BorderBrush="#B71C1C"/>
           <Button Name="ReloadButton" Content="↻" Width="36" Height="36" Background="#6A1B9A" Foreground="#FFF" BorderBrush="#4A0E68"/>
           <Button Name="OpenButton" Content="📂" Width="36" Height="36" Background="#455A64" Foreground="#FFF" BorderBrush="#2C3E43"/>
+          <Button Name="UseRepoLibsButton" Content="Libs: Repo" Width="110" Height="28" Background="#455A64" Foreground="#FFF" BorderBrush="#2C3E43"/>
           <Button Name="SettingsButton" Content="⚙" Width="36" Height="36" Background="#37474F" Foreground="#FFF" BorderBrush="#222"/>
         </StackPanel>
       </DockPanel>
