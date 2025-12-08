@@ -43,6 +43,24 @@ namespace Flux
             if (string.IsNullOrEmpty(folderPath)) return null;
             var name = System.IO.Path.GetFileName(folderPath.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar));
             var runner = new LuaRunner(name, _frameManager, folderPath);
+            // Load saved variables from data/savedvars/{addon}.json if present
+            try
+            {
+                var svDir = System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "data", "savedvars");
+                var svPath = System.IO.Path.Combine(svDir, name + ".json");
+                if (System.IO.File.Exists(svPath))
+                {
+                    try
+                    {
+                        var json = System.IO.File.ReadAllText(svPath);
+                        var dict = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object?>>(json);
+                        if (dict != null) runner.LoadSavedVariables(dict);
+                        runner.EmitOutput($"[AddonManager] Loaded saved variables from: {svPath}");
+                    }
+                    catch (Exception ex) { runner.EmitOutput("[AddonManager] Failed to load saved variables: " + ex.Message); }
+                }
+            }
+            catch { }
             // If configured to prefer repo libs, preload them before running the addon.
             try
             {
@@ -69,6 +87,15 @@ namespace Flux
             runner.EmitOutput($"[AddonManager] Loaded (fresh) addon: {name}");
             // Install watchers before running so we can catch corruption during load
             try { runner.InstallAceLocaleWriteWatcher(); } catch { }
+            // Inject a small test roster to help unitframe/party/raid code when running locally
+            try
+            {
+                var rosterScript = @"Flux_SetRoster({ 'Alice', { name = 'Bob', class = 'MAGE', level = 60 }, 'Charlie' })";
+                runner.RunScriptFromString(rosterScript, name, null, false, 0, null);
+                runner.EmitOutput("[AddonManager] Injected test roster via Flux_SetRoster");
+            }
+            catch (Exception ex) { runner.EmitOutput("[AddonManager] Failed to inject roster: " + ex.Message); }
+
             // Immediately load and run the addon files (TOC or all .lua)
             try { runner.LoadAndRunAddon(folderPath); } catch (Exception ex) { runner.EmitOutput($"[AddonManager] error running addon: {ex.Message}"); }
             return runner;
@@ -86,7 +113,23 @@ namespace Flux
         // Save saved variables (no-op placeholder for fresh restart)
         public void SaveSavedVariables(string addonName)
         {
-            if (_runners.TryGetValue(addonName, out var r)) r.EmitOutput("[AddonManager] SaveSavedVariables (noop in fresh restart)");
+            if (_runners.TryGetValue(addonName, out var r))
+            {
+                try
+                {
+                    var dict = r.GetSavedVariablesAsObject();
+                    var svDir = System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), "data", "savedvars");
+                    try { System.IO.Directory.CreateDirectory(svDir); } catch { }
+                    var svPath = System.IO.Path.Combine(svDir, addonName + ".json");
+                    var json = System.Text.Json.JsonSerializer.Serialize(dict, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                    System.IO.File.WriteAllText(svPath, json);
+                    r.EmitOutput($"[AddonManager] Saved saved variables to: {svPath}");
+                }
+                catch (Exception ex)
+                {
+                    r.EmitOutput("[AddonManager] SaveSavedVariables error: " + ex.Message);
+                }
+            }
         }
 
         // Stop all runners

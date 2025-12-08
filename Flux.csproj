@@ -14,6 +14,7 @@
     <PackageReference Include="MoonSharp" Version="2.0.0" />
     <PackageReference Include="Avalonia.ReactiveUI" Version="11.0.0" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.0.0" />
+  <PackageReference Include="KopiLua" Version="1.0.8" />
   </ItemGroup>
   <!-- Exclude test projects from the default compile set when tests live under the repo folder -->
   <ItemGroup>

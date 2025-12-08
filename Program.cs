@@ -10,6 +10,17 @@ namespace Flux
         {
             try
             {
+                // Quick prototype check for KopiLua availability before launching UI
+                try
+                {
+                    var (ok, msg) = KopiLuaRunner.TryRunString("return 1+1");
+                    Console.WriteLine("[KopiLuaProbe] " + (ok ? "available" : "missing") + " - " + msg);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[KopiLuaProbe] probe failed: " + ex.Message);
+                }
+
                 BuildAvaloniaApp()
                     .StartWithClassicDesktopLifetime(args);
             }
