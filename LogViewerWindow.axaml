@@ -1,0 +1,17 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Flux.LogViewerWindow"
+        Title="Flux Logs"
+        Width="900" Height="600">
+  <DockPanel LastChildFill="True">
+    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="6">
+      <Button Name="RefreshLogsButton" Content="Refresh" Width="80"/>
+      <TextBlock Text="  Double-click a file to open" VerticalAlignment="Center" Margin="8,0,0,0"/>
+    </StackPanel>
+
+    <Grid ColumnDefinitions="320, *" RowDefinitions="*">
+      <ListBox Name="LogsList" Grid.Column="0" Margin="6"/>
+      <TextBox Name="LogContent" Grid.Column="1" Margin="6" AcceptsReturn="True" IsReadOnly="True" TextWrapping="NoWrap"/>
+    </Grid>
+  </DockPanel>
+</Window>
