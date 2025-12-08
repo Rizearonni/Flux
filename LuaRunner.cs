@@ -33,6 +33,8 @@ namespace Flux
         private readonly HashSet<string> _clearedAddons = new(StringComparer.OrdinalIgnoreCase);
         // Stop flag to allow cooperative shutdown from UI
         private volatile bool _stopping = false;
+        // Whether we've installed the AceLocale write watcher
+        private volatile bool _aceLocaleWatcherInstalled = false;
         // Monotonic execution sequence for chunk executions (helps trace repeated runs)
         private long _execSequence = 0;
         // Throttle state for noisy NewAddon wrapper diagnostics (per-key last emit time)
@@ -51,7 +53,132 @@ namespace Flux
                 OnOutput?.Invoke(this, s);
             }
             catch { }
+
+            // Install a watcher that will detect accidental writes into AceLocale.__locales
+            // and log when non-table values are stored (helps trace where strings/nils get inserted).
+            try
+            {
+                InstallAceLocaleWriteWatcher();
+            }
+            catch { }
             try { Console.WriteLine(s); } catch { }
+        }
+
+        // Add instrumentation: watch AceLocale.__locales for non-table assignments
+        private void InstallAceLocaleWriteWatcher()
+        {
+            if (_aceLocaleWatcherInstalled) return;
+            // Poll for the LibStub/AceLocale table until it's present, then attach the watcher
+            var timer = new System.Timers.Timer(200);
+            timer.AutoReset = true;
+            timer.Elapsed += (s, e) =>
+            {
+                try
+                {
+                    var libStubDv = _script.Globals.Get("LibStub");
+                    if (libStubDv == null || libStubDv.IsNil() || libStubDv.Type != DataType.Table) return;
+                    var libsDv = libStubDv.Table.Get("libs");
+                    if (libsDv == null || libsDv.IsNil() || libsDv.Type != DataType.Table) return;
+
+                    var ace = libsDv.Table.Get("AceLocale-3.0");
+                    if (ace == null || ace.IsNil() || ace.Type != DataType.Table) return;
+
+                    // Ensure __locales table exists
+                    var locales = ace.Table.Get("__locales");
+                    Table localesTbl;
+                    if (locales == null || locales.IsNil() || locales.Type != DataType.Table)
+                    {
+                        localesTbl = new Table(_script);
+                        ace.Table.Set("__locales", DynValue.NewTable(localesTbl));
+                    }
+                    else
+                    {
+                        localesTbl = locales.Table;
+                    }
+
+                    // Attach metatable with __newindex to detect writes
+                    var mt = new Table(_script);
+                    mt.Set("__newindex", DynValue.NewCallback((ctx, args) =>
+                    {
+                        try
+                        {
+                            // args: [0]=table, [1]=key, [2]=value
+                            var key = args.Count >= 2 ? args[1].ToPrintString() ?? "<nil>" : "<nil>";
+                            var val = args.Count >= 3 ? args[2] : DynValue.Nil;
+                            var tname = "AceLocale-3.0.__locales";
+                            string valType = val.Type.ToString();
+                            if (val.Type != DataType.Table)
+                            {
+                                try { EmitOutput($"[LuaWatcher] {tname} newindex key={key} assigned non-table type={valType} val={val.ToPrintString()}"); } catch { }
+                            }
+                        }
+                        catch { }
+                        return DynValue.Nil;
+                    }));
+
+                    // Set the metatable on the __locales table so writes are intercepted
+                    localesTbl.MetaTable = mt;
+                    // Also attach a watcher on the AceLocale table itself to catch overwrites
+                    try { InstallAceLocaleTableWatcher(ace.Table); } catch { }
+                    _aceLocaleWatcherInstalled = true;
+                    try { EmitOutput("[LuaWatcher] Installed AceLocale.__locales write watcher"); } catch { }
+
+                    // Stop timer
+                    try { timer.Stop(); timer.Dispose(); } catch { }
+                }
+                catch { }
+            };
+            timer.Start();
+        }
+
+        // Also attach a metatable to the AceLocale table itself to detect when keys like
+        // 'apps' or '__locales' are overwritten with non-table values (common source of corruption).
+        private void InstallAceLocaleTableWatcher(Table aceTable)
+        {
+            try
+            {
+                var mt = aceTable.MetaTable ?? new Table(_script);
+                var existingNewIndex = mt.Get("__newindex");
+
+                mt.Set("__newindex", DynValue.NewCallback((ctx, args) =>
+                {
+                    try
+                    {
+                        if (args.Count >= 2)
+                        {
+                            var key = args[1].ToPrintString() ?? "<nil>";
+                            var val = args.Count >= 3 ? args[2] : DynValue.Nil;
+                            if ((key == "apps" || key == "__locales") && val.Type != DataType.Table)
+                            {
+                                try { EmitOutput($"[LuaWatcher] AceLocale table newindex key={key} assigned non-table type={val.Type} val={val.ToPrintString()}"); } catch { }
+                            }
+                        }
+                    }
+                    catch { }
+
+                    // Call through to existing __newindex if present
+                    try
+                    {
+                        if (existingNewIndex != null && !existingNewIndex.IsNil())
+                        {
+                            if (existingNewIndex.Type == DataType.Function || existingNewIndex.Type == DataType.ClrFunction)
+                            {
+                                try { _script.Call(existingNewIndex, args.ToArray()); } catch { }
+                            }
+                        }
+                    }
+                    catch { }
+
+                    return DynValue.Nil;
+                }));
+
+                aceTable.MetaTable = mt;
+                try { EmitOutput("[LuaWatcher] Installed AceLocale table newindex watcher"); } catch { }
+            }
+            catch (Exception ex)
+            {
+                try { EmitOutput("[LuaWatcher] failed to attach AceLocale table watcher: " + ex.Message); } catch { }
+            }
         }
         // Emit a message but throttle repeated messages per-key to reduce noise.
         private void EmitThrottled(string key, string message, int msInterval = 5000)
@@ -2035,14 +2162,41 @@ namespace Flux
                         var idx = mt.Get("__index");
                         if (idx == null || idx.IsNil())
                         {
+                            // Only return a string placeholder for locale-like libraries.
+                            // For general libraries, missing keys should remain nil so
+                            // callers can create tables/functions as needed. This avoids
+                            // cases where a generic __index returning the key string
+                            // causes code to see a string where it expects a function/table.
                             mt.Set("__index", DynValue.NewCallback((c2, a2) =>
                             {
                                 try
                                 {
-                                    if (a2.Count >= 2 && a2[1].Type == DataType.String) return DynValue.NewString(a2[1].String);
+                                    // a2[0] is the table being indexed; a2[1] is the key
+                                    if (a2.Count >= 2 && a2[1].Type == DataType.String)
+                                    {
+                                        // If the table identifies itself as an AceLocale table,
+                                        // provide a string fallback (common expectation for locales).
+                                        try
+                                        {
+                                            if (a2[0] != null && a2[0].Type == DataType.Table)
+                                            {
+                                                var nameDv = a2[0].Table.Get("__name");
+                                                if (nameDv != null && nameDv.Type == DataType.String)
+                                                {
+                                                    var libName = nameDv.String ?? string.Empty;
+                                                    if (libName.IndexOf("AceLocale", StringComparison.OrdinalIgnoreCase) >= 0)
+                                                    {
+                                                        return DynValue.NewString(a2[1].String);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        catch { }
+                                    }
                                 }
                                 catch { }
-                                return DynValue.NewString(string.Empty);
+                                // For non-locale libs, return nil for missing keys.
+                                return DynValue.Nil;
                             }));
                             t.MetaTable = mt;
                         }

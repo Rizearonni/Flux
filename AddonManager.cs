@@ -9,6 +9,9 @@ namespace Flux
 {
     public class AddonManager
     {
+        // When true, prefer the repo/workspace Ace3 + repo `libs` folder; when false, load only the addon's embedded libs
+        private bool _useRepoLibs = true;
+        private readonly string _settingsFile;
         private readonly string _dataDir;
         private readonly Dictionary<string, LuaRunner> _runners = new();
         private readonly FrameManager? _frameManager;
@@ -20,6 +23,58 @@ namespace Flux
             _dataDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "data", "savedvars");
             _dataDir = Path.GetFullPath(_dataDir);
             Directory.CreateDirectory(_dataDir);
+            // settings file alongside savedvars
+            _settingsFile = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "data", "settings.json"));
+            LoadSettings();
+
+            // If a FrameManager is available, add a small toggle button as a VisualFrame to control repo-local libs mode
+            try
+            {
+                if (_frameManager != null)
+                {
+                    var tf = _frameManager.CreateFrame(null);
+                    tf.X = 8; tf.Y = 8; tf.Width = 180; tf.Height = 28;
+                    tf.Text = GetToggleText();
+                    tf.OnClickAction = () =>
+                    {
+                        _useRepoLibs = !_useRepoLibs;
+                        tf.Text = GetToggleText();
+                        SaveSettings();
+                    };
+                    _frameManager.UpdateVisual(tf);
+                }
+            }
+            catch { }
+        }
+
+        private string GetToggleText() => _useRepoLibs ? "Use Repo/Workspace Libs: ON" : "Use Repo/Workspace Libs: OFF";
+
+        private void LoadSettings()
+        {
+            try
+            {
+                if (File.Exists(_settingsFile))
+                {
+                    var json = File.ReadAllText(_settingsFile);
+                    var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("useRepoLibs", out var el) && el.ValueKind == JsonValueKind.True) _useRepoLibs = true;
+                    else if (doc.RootElement.TryGetProperty("useRepoLibs", out var el2) && el2.ValueKind == JsonValueKind.False) _useRepoLibs = false;
+                }
+            }
+            catch { }
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                var obj = new { useRepoLibs = _useRepoLibs };
+                var js = JsonSerializer.Serialize(obj, new JsonSerializerOptions { WriteIndented = true });
+                var d = Path.GetDirectoryName(_settingsFile) ?? Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "data"));
+                Directory.CreateDirectory(d);
+                File.WriteAllText(_settingsFile, js);
+            }
+            catch { }
         }
 
         public IEnumerable<string> LoadedAddons => _runners.Keys.ToList();
@@ -196,53 +251,115 @@ namespace Flux
 ";
                 try { runner.RunScriptFromString(defensive, addonName, null, isLibraryFile: false, libraryMinor: 0, filePath: "__defensive_callbackhandler.lua"); } catch { }
 
+                // Ensure there is an AceLocale entry for this addon BEFORE loading workspace/repo libs
+                // Some libraries call LibStub('AceLocale-3.0'):GetLocale(app) during their load, so pre-register
+                var ensureLocaleBeforeLibs = $@"
+if type(LibStub) ~= 'table' then LibStub = LibStub or {{ libs = {{}} }} end
+LibStub.libs = LibStub.libs or {{}}
+local ok, ace = pcall(function() return LibStub and LibStub('AceLocale-3.0') end)
+if not ok or type(ace) ~= 'table' then
+    LibStub.libs['AceLocale-3.0'] = LibStub.libs['AceLocale-3.0'] or {{ __locales = {{}} }}
+    local a = LibStub.libs['AceLocale-3.0']
+    function a:NewLocale(app, locale, isDefault, silent)
+        a.__locales[app] = a.__locales[app] or {{}}
+        return a.__locales[app]
+    end
+    function a:GetLocale(app, silent)
+        a.__locales[app] = a.__locales[app] or {{}}
+        local cur = (GetLocale and GetLocale()) or 'enUS'
+        return a.__locales[app][cur] or a.__locales[app]
+    end
+end
+-- ensure an entry exists for this addon so GetLocale won't error
+if type(LibStub.libs['AceLocale-3.0']) == 'table' then
+    LibStub.libs['AceLocale-3.0'].__locales = LibStub.libs['AceLocale-3.0'].__locales or {{}}
+    LibStub.libs['AceLocale-3.0'].__locales['{addonName}'] = LibStub.libs['AceLocale-3.0'].__locales['{addonName}'] or {{}}
+end
+";
+                try { runner.RunScriptFromString(ensureLocaleBeforeLibs, addonName, null, isLibraryFile: false, libraryMinor: 0, filePath: "__ensure_locale_before_libs.lua"); } catch { }
+
                 // Preload workspace Ace3 libs (preferred) and local libs
                 var whitelist = new[] { "AceAddon-3.0","AceEvent-3.0","AceComm-3.0","AceConsole-3.0","AceDB-3.0","AceGUI-3.0","AceLocale-3.0","CallbackHandler-1.0","LibStub","LibDataBroker-1.1","LibDBIcon-1.0","AceTimer-3.0","AceConfig-3.0" };
                 try
                 {
-                    var workspaceAce = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "Ace3"));
-                    if (Directory.Exists(workspaceAce))
+                    if (_useRepoLibs)
                     {
-                        foreach (var file in Directory.GetFiles(workspaceAce, "*.lua", SearchOption.AllDirectories))
+                        // Load repo-level 'libs' folder (if present)
+                        var repoLibs = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "libs"));
+                        if (Directory.Exists(repoLibs))
                         {
-                            try
+                            foreach (var file in Directory.GetFiles(repoLibs, "*.lua", SearchOption.AllDirectories))
                             {
-                                var rel = Path.GetRelativePath(workspaceAce, file).Replace('\\', '/');
-                                if (whitelist.Any(w => rel.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0))
+                                try
                                 {
-                                    var code = File.ReadAllText(file);
-                                    var libName = Path.GetFileNameWithoutExtension(file);
-                                    runner.RunScriptFromString(code, addonName, libName, isLibraryFile: true, libraryMinor: 0, filePath: file);
+                                    var rel = Path.GetRelativePath(repoLibs, file).Replace('\\', '/');
+                                    if (whitelist.Any(w => rel.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0))
+                                    {
+                                        var code = File.ReadAllText(file);
+                                        var libName = Path.GetFileNameWithoutExtension(file);
+                                        runner.RunScriptFromString(code, addonName, libName, isLibraryFile: true, libraryMinor: 0, filePath: file);
+                                    }
                                 }
+                                catch { }
                             }
-                            catch { }
+                        }
+
+                        // Preload workspace Ace3 as before
+                        var workspaceAce = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "Ace3"));
+                        if (Directory.Exists(workspaceAce))
+                        {
+                            foreach (var file in Directory.GetFiles(workspaceAce, "*.lua", SearchOption.AllDirectories))
+                            {
+                                try
+                                {
+                                    var rel = Path.GetRelativePath(workspaceAce, file).Replace('\\', '/');
+                                    if (whitelist.Any(w => rel.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0))
+                                    {
+                                        var code = File.ReadAllText(file);
+                                        var libName = Path.GetFileNameWithoutExtension(file);
+                                        runner.RunScriptFromString(code, addonName, libName, isLibraryFile: true, libraryMinor: 0, filePath: file);
+                                    }
+                                }
+                                catch { }
+                            }
                         }
                     }
                 }
                 catch { }
 
-                // Local libs
+                // Local libs (optional). Set environment variable `FLUX_SKIP_LOCAL_LIBS=1` to disable loading
                 try
                 {
-                    var libDirs = new[] { "Libs", "libs", "lib", "Lib" };
-                    foreach (var libDirName in libDirs)
+                    // If _useRepoLibs is true, we intentionally skip loading the addon's embedded libs
+                    var envSkip = string.Equals(Environment.GetEnvironmentVariable("FLUX_SKIP_LOCAL_LIBS"), "1", StringComparison.OrdinalIgnoreCase);
+                    var effectiveSkipLocal = _useRepoLibs || envSkip;
+                    if (!effectiveSkipLocal)
                     {
-                        var localLibFull = Path.GetFullPath(Path.Combine(folderPath, libDirName));
-                        if (!Directory.Exists(localLibFull)) continue;
-                        foreach (var file in Directory.GetFiles(localLibFull, "*.lua", SearchOption.AllDirectories))
+                        var libDirs = new[] { "Libs", "libs", "lib", "Lib" };
+                        foreach (var libDirName in libDirs)
                         {
-                            try
+                            var localLibFull = Path.GetFullPath(Path.Combine(folderPath, libDirName));
+                            if (!Directory.Exists(localLibFull)) continue;
+                            foreach (var file in Directory.GetFiles(localLibFull, "*.lua", SearchOption.AllDirectories))
                             {
-                                var rel = Path.GetRelativePath(localLibFull, file).Replace('\\', '/');
-                                if (whitelist.Any(w => rel.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0))
+                                try
                                 {
-                                    var code = File.ReadAllText(file);
-                                    var libName = Path.GetFileNameWithoutExtension(file);
-                                    runner.RunScriptFromString(code, addonName, libName, isLibraryFile: true, libraryMinor: 0, filePath: file);
+                                    var rel = Path.GetRelativePath(localLibFull, file).Replace('\\', '/');
+                                    if (whitelist.Any(w => rel.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0))
+                                    {
+                                        var code = File.ReadAllText(file);
+                                        var libName = Path.GetFileNameWithoutExtension(file);
+                                        runner.RunScriptFromString(code, addonName, libName, isLibraryFile: true, libraryMinor: 0, filePath: file);
+                                    }
                                 }
+                                catch { }
                             }
-                            catch { }
                         }
+                    }
+                    else
+                    {
+                        // Diagnostics: report that local libs were skipped (either toggle or env var)
+                        outputCallback?.Invoke(this, $"[AddonManager] Skipping local libs for {addonName} due to settings (useRepoLibs={_useRepoLibs}) or FLUX_SKIP_LOCAL_LIBS={envSkip}");
                     }
                 }
                 catch { }

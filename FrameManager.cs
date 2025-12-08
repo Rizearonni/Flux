@@ -16,6 +16,8 @@ namespace Flux
         public string Id { get; }
         // Closure invoked when an 'OnEvent' script is set via frame:SetScript("OnEvent", fn)
         public Closure? OnEvent { get; set; }
+        // Allow attaching a native C# click action for UI controls created by the host
+        public Action? OnClickAction { get; set; }
         public double X { get; set; }
         public double Y { get; set; }
         public double Width { get; set; } = 100;
@@ -44,7 +46,8 @@ namespace Flux
         public Avalonia.Controls.Image? Portrait { get; set; }
         // Optional class name to influence color styling
         public string? ClassName { get; set; }
-        public LuaRunner Owner { get; }
+        // Owner can be null for host-managed frames (not tied to a LuaRunner)
+        public LuaRunner? Owner { get; }
 
         // Map of eventName -> wrapper closure stored when RegisterEvent is called
         public Dictionary<string, Closure>? RegisteredEventWrappers { get; set; }
@@ -52,7 +55,7 @@ namespace Flux
         public Rectangle Visual { get; set; }
         public TextBlock? VisualText { get; set; }
 
-        public VisualFrame(string id, LuaRunner owner)
+        public VisualFrame(string id, LuaRunner? owner)
         {
             Id = id;
             Owner = owner;
@@ -118,7 +121,7 @@ namespace Flux
 
                     foreach (var f in _frames)
                     {
-                        if (f.OnUpdate != null)
+                        if (f.OnUpdate != null && f.Owner != null)
                         {
                             try { f.Owner.InvokeClosure(f.OnUpdate, delta); } catch { }
                         }
@@ -147,7 +150,7 @@ namespace Flux
                                 if (_hoveredFrame.VisualText != null) _hoveredFrame.VisualText.Text = _hoveredFrame.Text ?? string.Empty;
                             }
                             catch { }
-                            try { if (_hoveredFrame.OnLeave != null) _hoveredFrame.Owner.InvokeClosure(_hoveredFrame.OnLeave); } catch { }
+                            try { if (_hoveredFrame.OnLeave != null && _hoveredFrame.Owner != null) _hoveredFrame.Owner.InvokeClosure(_hoveredFrame.OnLeave); } catch { }
                         }
                         _hoveredFrame = hit;
                         if (hit != null)
@@ -160,7 +163,7 @@ namespace Flux
                                 if (hit.VisualText != null) hit.VisualText.Text = (hit.Text ?? string.Empty) + " (hover)";
                             }
                             catch { }
-                            try { if (hit.OnEnter != null) hit.Owner.InvokeClosure(hit.OnEnter); } catch { }
+                            try { if (hit.OnEnter != null && hit.Owner != null) hit.Owner.InvokeClosure(hit.OnEnter); } catch { }
                         }
                     }
                 }
@@ -175,14 +178,24 @@ namespace Flux
                     var hit = HitTest(p);
                     if (hit != null)
                     {
-                        try { if (hit.OnClick != null) hit.Owner.InvokeClosure(hit.OnClick); } catch { }
+                        try
+                        {
+                            // First invoke any native C# click action
+                            try { hit.OnClickAction?.Invoke(); } catch { }
+                            // Then invoke Lua closure if present
+                            if (hit.OnClick != null && hit.Owner != null)
+                            {
+                                try { hit.Owner.InvokeClosure(hit.OnClick); } catch { }
+                            }
+                        }
+                        catch { }
                     }
                 }
                 catch { }
             };
         }
 
-        public VisualFrame CreateFrame(LuaRunner owner)
+        public VisualFrame CreateFrame(LuaRunner? owner)
         {
             var id = Guid.NewGuid().ToString("N");
             var vf = new VisualFrame(id, owner);
